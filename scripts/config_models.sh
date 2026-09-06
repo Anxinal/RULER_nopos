@@ -83,6 +83,16 @@ MODEL_SELECT() {
             TOKENIZER_TYPE="gemini"
             GEMINI_API_KEY=""
             ;;
+        # ---- Custom MaskedTransformer models ----
+        # Set TMODEL_CHECKPOINT env var to the checkpoint path before calling run.sh
+        # e.g.  TMODEL_CHECKPOINT=/path/to/best.pt bash run.sh tmodel synthetic
+        tmodel)
+            MODEL_PATH="${TMODEL_CHECKPOINT:?Set TMODEL_CHECKPOINT to the .pt checkpoint path}"
+            MODEL_TEMPLATE_TYPE="base"
+            MODEL_FRAMEWORK="tmodel"
+            TOKENIZER_PATH="${TMODEL_TOKENIZER:-gpt2}"
+            TOKENIZER_TYPE="hf"
+            ;;
     esac
 
 

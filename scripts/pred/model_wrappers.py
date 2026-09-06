@@ -130,3 +130,81 @@ class MambaModel:
     def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
         # FIXME: naive implementation
         return [self.__call__(prompt, **kwargs) for prompt in prompts]
+
+
+class MaskedTransformerModel:
+    """Wrapper for the custom MaskedTransformer (encoder-decoder).
+
+    Loads a checkpoint saved by ``scripts/tmodel/train.py`` and exposes the
+    same ``process_batch`` interface used by the RULER prediction pipeline.
+    """
+
+    def __init__(self, name_or_path: str, **generation_kwargs) -> None:
+        from transformers import AutoTokenizer
+        import sys as _sys, os as _os
+
+        # Make the tmodel package importable
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+        from tmodel import MaskedTransformer
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        ckpt = torch.load(name_or_path, map_location=self.device, weights_only=False)
+        model_args = ckpt["args"]
+
+        # Tokenizer
+        tok_name = model_args.get("tokenizer", "gpt2")
+        self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Rebuild model from saved hyper-parameters
+        self.max_len = model_args.get("max_len", 8192)
+        self.model = MaskedTransformer(
+            vocab_size=self.tokenizer.vocab_size,
+            d_model=model_args["d_model"],
+            num_heads=model_args["num_heads"],
+            num_encoder_layers=model_args["num_layers"],
+            num_decoder_layers=model_args["num_layers"],
+            d_ff=model_args["d_ff"],
+            pe_type=model_args["pe_type"],
+            encoder_mask_type=model_args["encoder_mask"],
+            decoder_mask_type=model_args["decoder_mask"],
+            max_len=self.max_len,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+        )
+        self.model.load_state_dict(ckpt["model"])
+        self.model.to(self.device).eval()
+
+        self.stop = generation_kwargs.pop("stop", [])
+        self.max_new_tokens = generation_kwargs.pop("max_new_tokens", 64)
+        self.temperature = generation_kwargs.get("temperature", 0.0)
+        self.top_k = generation_kwargs.get("top_k", 0)
+
+    def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
+        return self.process_batch([prompt], **kwargs)[0]
+
+    def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
+        results = []
+        for prompt in prompts:
+            inputs = self.tokenizer(
+                prompt, return_tensors="pt", truncation=True, max_length=self.max_len,
+            )
+            input_ids = inputs.input_ids.to(self.device)
+
+            output_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=self.max_new_tokens,
+                bos_token_id=self.tokenizer.bos_token_id or self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                temperature=self.temperature,
+                top_k=self.top_k,
+            )
+
+            # Decode (skip the leading BOS token the decoder started with)
+            text = self.tokenizer.decode(output_ids[0, 1:], skip_special_tokens=True)
+
+            for s in self.stop:
+                text = text.split(s)[0]
+
+            results.append({"text": [text]})
+        return results
