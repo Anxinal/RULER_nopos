@@ -25,20 +25,25 @@ python evaluate.py \
 
 import re
 import os
+import sys
 import argparse
 import nltk
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
-    
+
 import pandas as pd
 import importlib
 import yaml
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+
+# Make the sibling `data` package importable so we can use the in-repo JSONL
+# reader instead of pulling in the whole NeMo toolkit for six lines of code.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.manifest_utils import read_manifest, write_manifest  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir", type=str, required=True, help='path to the prediction jsonl files')
@@ -115,6 +120,9 @@ def run_evaluation_per_task(task_config: dict, predictions_file: str, verbose: i
 
 def write_evaluation(results: dict):
     tasks = list(results.keys())
+    if not tasks:
+        print(f'No prediction files were evaluated in {args.data_dir}; nothing to summarise.')
+        return
     score = [results[task]['score'] for task in tasks]
     nulls = [results[task]['nulls'] for task in tasks]
     dfs = [
@@ -171,8 +179,11 @@ def main():
     
     try:
         module = importlib.import_module(f"{args.benchmark}.constants")
-    except ImportError:
-        print(f"Module eval.{args.benchmark}.constants not found.")
+    except ImportError as e:
+        raise SystemExit(
+            f"Module eval.{args.benchmark}.constants not found ({e}). "
+            f"Run this script so that {curr_folder} is importable."
+        )
 
     tasks_base = module.TASKS
     with open(os.path.join(curr_folder, f"../{args.benchmark}.yaml"), "r") as f:

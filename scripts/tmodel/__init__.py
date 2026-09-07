@@ -12,7 +12,14 @@ Quick start::
     )
 """
 
-from .masks import Mask, CausalMask, FutureOnlyMask, BidirectionalMask
+from .masks import (
+    Mask,
+    CausalMask,
+    FutureOnlyMask,
+    BidirectionalMask,
+    build_additive_mask,
+    clear_mask_cache,
+)
 from .PositionalEmbeddings import (
     PositionalEmbedding,
     NoPositionalEmbedding,

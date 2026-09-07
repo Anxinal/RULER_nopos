@@ -44,23 +44,26 @@ class TransformerDecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         encoder_output: torch.Tensor,
-        self_attn_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_bias: Optional[torch.Tensor] = None,
+        cross_attn_bias: Optional[torch.Tensor] = None,
         pe: Optional[PositionalEmbedding] = None,
     ) -> torch.Tensor:
         """
         Args:
             x:               ``[batch, tgt_len, d_model]``
             encoder_output:  ``[batch, src_len, d_model]``
-            self_attn_mask:  mask for decoder self-attention.
-            cross_attn_mask: mask for cross-attention (rarely used).
-            pe:              positional embedding (RoPE/ALiBi applied in
-                             self-attention only; cross-attention is skipped).
+            self_attn_bias:  additive bias for decoder self-attention, combining the
+                             decoder mask with the *target* padding mask.
+            cross_attn_bias: additive bias for cross-attention, carrying the *source*
+                             padding mask so the decoder never reads padded encoder
+                             positions.
+            pe:              positional embedding (RoPE applied in self-attention only;
+                             cross-attention is skipped).
         """
         # 1. Self-attention
         residual = x
         x = self.norm1(x)
-        x = self.self_attn(x, x, x, attn_mask=self_attn_mask, pe=pe)
+        x = self.self_attn(x, x, x, attn_bias=self_attn_bias, pe=pe)
         x = self.dropout1(x) + residual
 
         # 2. Cross-attention
@@ -68,7 +71,7 @@ class TransformerDecoderLayer(nn.Module):
         x = self.norm2(x)
         x = self.cross_attn(
             x, encoder_output, encoder_output,
-            attn_mask=cross_attn_mask,
+            attn_bias=cross_attn_bias,
             pe=pe,
             is_cross_attention=True,
         )
@@ -112,10 +115,10 @@ class TransformerDecoder(nn.Module):
         self,
         x: torch.Tensor,
         encoder_output: torch.Tensor,
-        self_attn_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_bias: Optional[torch.Tensor] = None,
+        cross_attn_bias: Optional[torch.Tensor] = None,
         pe: Optional[PositionalEmbedding] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, encoder_output, self_attn_mask, cross_attn_mask, pe)
+            x = layer(x, encoder_output, self_attn_bias, cross_attn_bias, pe)
         return self.final_norm(x)

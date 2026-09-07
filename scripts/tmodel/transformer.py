@@ -25,7 +25,25 @@ from typing import Optional
 from .PositionalEmbeddings import build_positional_embedding
 from .transformer_encoder import TransformerEncoder
 from .transformer_decoder import TransformerDecoder
-from .masks import CausalMask, FutureOnlyMask
+from .masks import CausalMask, FutureOnlyMask, build_additive_mask
+
+
+def _compute_dtype(device: torch.device) -> torch.dtype:
+    """Dtype the attention will actually run in, honouring autocast.
+
+    Attention masks must match the query dtype that
+    :func:`torch.nn.functional.scaled_dot_product_attention` sees. Under autocast the
+    projections emit half precision even though the parameters are float32, so reading
+    the dtype off the embedding output would give the wrong answer and force a costly
+    per-layer cast of a tensor that can be gigabytes at long context.
+    """
+    if device.type == "cuda" and torch.is_autocast_enabled():
+        # torch >= 2.4 prefers get_autocast_dtype(device_type); the older spelling is
+        # what the NGC 23.10 image (torch 2.1) provides.
+        if hasattr(torch, "get_autocast_dtype"):
+            return torch.get_autocast_dtype("cuda")
+        return torch.get_autocast_gpu_dtype()
+    return torch.get_default_dtype()
 
 
 class MaskedTransformer(nn.Module):
@@ -69,6 +87,9 @@ class MaskedTransformer(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.vocab_size = vocab_size
+        self.max_len = max_len
         self.pad_token_id = pad_token_id
         self.encoder_mask_type = encoder_mask_type
         self.decoder_mask_type = decoder_mask_type
@@ -105,16 +126,71 @@ class MaskedTransformer(nn.Module):
     # Mask helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_mask(
-        mask_type: str, dim: int, device: torch.device,
+    def _padding_mask(self, tokens: torch.Tensor) -> Optional[torch.Tensor]:
+        """``[batch, seq]`` bool mask, ``True`` where the token is padding.
+
+        Returns ``None`` when the batch contains no padding, so the common
+        single-sequence inference path allocates nothing.
+        """
+        pad = tokens.eq(self.pad_token_id)
+        return pad if pad.any() else None
+
+    def _build_attn_bias(
+        self,
+        mask_type: Optional[str],
+        q_len: int,
+        k_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        use_alibi: bool = False,
     ) -> Optional[torch.Tensor]:
-        """Return a ``[dim, dim]`` additive mask or ``None`` (bidirectional)."""
-        if mask_type == "C":
-            return CausalMask(dim).tensor.to(device)
-        if mask_type == "F":
-            return FutureOnlyMask(dim).tensor.to(device)
-        return None  # "B" -- bidirectional: no mask needed
+        """Combine attention mask, ALiBi bias and key padding into one additive tensor.
+
+        Built once per forward pass and shared by every layer, rather than reconstructed
+        inside each attention call. Shapes are kept broadcastable so nothing is expanded
+        to the full ``[batch, heads, q_len, k_len]`` unless ALiBi genuinely requires a
+        per-head term.
+
+        Args:
+            mask_type: ``"B"``, ``"C"``, ``"F"``, or ``None`` for cross-attention.
+            q_len, k_len: query and key lengths.
+            device, dtype: must match the attention query tensor.
+            key_padding_mask: ``[batch, k_len]`` bool, ``True`` at padded keys.
+            use_alibi: whether to fold in the ALiBi per-head bias.
+
+        Returns:
+            Additive bias broadcastable to ``[batch, heads, q_len, k_len]``, or ``None``
+            when nothing needs masking at all.
+        """
+        neg = torch.finfo(dtype).min
+        bias = None
+
+        # Per-head ALiBi term -> [1, heads, q_len, k_len]
+        if use_alibi:
+            alibi = self.pe.attention_bias(q_len, k_len, self.num_heads, device, dtype)
+            if alibi is not None:
+                bias = alibi.unsqueeze(0)
+
+        # Square causal / future-only mask -> [1, 1, q_len, k_len]
+        if mask_type is not None:
+            mask = build_additive_mask(mask_type, q_len, device, dtype)
+            if mask is not None:
+                mask = mask[:q_len, :k_len].view(1, 1, q_len, k_len)
+                bias = mask if bias is None else bias + mask
+
+        # Key padding -> [batch, 1, 1, k_len]
+        if key_padding_mask is not None:
+            pad = torch.zeros(
+                key_padding_mask.shape, device=device, dtype=dtype,
+            ).masked_fill(key_padding_mask, neg).view(-1, 1, 1, k_len)
+            bias = pad if bias is None else bias + pad
+
+        if bias is not None:
+            # Two finite minima can sum below the dtype's range and become -inf, which
+            # would reintroduce the NaN that finite masking exists to avoid.
+            bias = bias.clamp_min(neg)
+        return bias
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -127,40 +203,93 @@ class MaskedTransformer(nn.Module):
             x = x + self.pe(tokens.shape[1], tokens.device)
         return self.embed_dropout(x)
 
-    def encode(self, src_tokens: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        src_tokens: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Run the encoder on *src_tokens* and return hidden states.
 
         Args:
             src_tokens: ``[batch, src_len]``
+            src_key_padding_mask: ``[batch, src_len]`` bool, ``True`` at padded
+                positions. Derived from ``pad_token_id`` when omitted.
 
         Returns:
             ``[batch, src_len, d_model]``
         """
+        if src_key_padding_mask is None:
+            src_key_padding_mask = self._padding_mask(src_tokens)
+
         x = self._embed(src_tokens)
-        attn_mask = self._build_mask(
-            self.encoder_mask_type, src_tokens.shape[1], src_tokens.device,
+        src_len = src_tokens.shape[1]
+        attn_bias = self._build_attn_bias(
+            mask_type=self.encoder_mask_type,
+            q_len=src_len,
+            k_len=src_len,
+            device=src_tokens.device,
+            dtype=_compute_dtype(src_tokens.device),
+            key_padding_mask=src_key_padding_mask,
+            use_alibi=self.pe.pe_type == "alibi",
         )
-        return self.encoder(x, attn_mask=attn_mask, pe=self.pe)
+        return self.encoder(x, attn_bias=attn_bias, pe=self.pe)
 
     def decode(
         self,
         tgt_tokens: torch.Tensor,
         encoder_output: torch.Tensor,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the decoder and return vocab logits.
 
         Args:
             tgt_tokens:     ``[batch, tgt_len]``
             encoder_output: ``[batch, src_len, d_model]``
+            tgt_key_padding_mask: ``[batch, tgt_len]`` bool for decoder self-attention.
+                Derived from ``pad_token_id`` when omitted.
+            src_key_padding_mask: ``[batch, src_len]`` bool for cross-attention. Must be
+                passed explicitly, since the source tokens are not available here and
+                the encoder output cannot be inspected for padding.
 
         Returns:
             ``[batch, tgt_len, vocab_size]``
         """
+        if tgt_key_padding_mask is None:
+            tgt_key_padding_mask = self._padding_mask(tgt_tokens)
+
         x = self._embed(tgt_tokens)
-        self_attn_mask = self._build_mask(
-            self.decoder_mask_type, tgt_tokens.shape[1], tgt_tokens.device,
+        device = tgt_tokens.device
+        dtype = _compute_dtype(device)
+        tgt_len = tgt_tokens.shape[1]
+
+        self_attn_bias = self._build_attn_bias(
+            mask_type=self.decoder_mask_type,
+            q_len=tgt_len,
+            k_len=tgt_len,
+            device=device,
+            dtype=dtype,
+            key_padding_mask=tgt_key_padding_mask,
+            use_alibi=self.pe.pe_type == "alibi",
         )
-        hidden = self.decoder(x, encoder_output, self_attn_mask=self_attn_mask, pe=self.pe)
+        # Cross-attention carries only the source padding: RoPE and ALiBi are skipped
+        # across the two sequences because their position spaces are incompatible.
+        cross_attn_bias = self._build_attn_bias(
+            mask_type=None,
+            q_len=tgt_len,
+            k_len=encoder_output.shape[1],
+            device=device,
+            dtype=dtype,
+            key_padding_mask=src_key_padding_mask,
+            use_alibi=False,
+        )
+
+        hidden = self.decoder(
+            x, encoder_output,
+            self_attn_bias=self_attn_bias,
+            cross_attn_bias=cross_attn_bias,
+            pe=self.pe,
+        )
         return self.output_proj(hidden)
 
     def forward(
@@ -177,7 +306,12 @@ class MaskedTransformer(nn.Module):
         Returns:
             Logits ``[batch, tgt_len, vocab_size]``
         """
-        return self.decode(tgt_tokens, self.encode(src_tokens))
+        src_key_padding_mask = self._padding_mask(src_tokens)
+        encoder_output = self.encode(src_tokens, src_key_padding_mask=src_key_padding_mask)
+        return self.decode(
+            tgt_tokens, encoder_output,
+            src_key_padding_mask=src_key_padding_mask,
+        )
 
     # ------------------------------------------------------------------
     # Generation (greedy / sampling)
@@ -206,15 +340,25 @@ class MaskedTransformer(nn.Module):
         Returns:
             ``[batch, generated_len]`` including the initial BOS token.
         """
-        encoder_output = self.encode(src_tokens)
+        src_key_padding_mask = self._padding_mask(src_tokens)
+        encoder_output = self.encode(src_tokens, src_key_padding_mask=src_key_padding_mask)
         bsz = src_tokens.shape[0]
         generated = torch.full(
             (bsz, 1), bos_token_id,
             dtype=torch.long, device=src_tokens.device,
         )
+        # Track which sequences have already emitted EOS so that, in a batch, a finished
+        # sequence is padded rather than continuing to sample past its stop token.
+        finished = torch.zeros(bsz, dtype=torch.bool, device=src_tokens.device)
 
         for _ in range(max_new_tokens):
-            logits = self.decode(generated, encoder_output)
+            # Everything generated so far is a real token, so the decoder needs no target
+            # padding mask; the source mask still gates cross-attention.
+            logits = self.decode(
+                generated, encoder_output,
+                tgt_key_padding_mask=None,
+                src_key_padding_mask=src_key_padding_mask,
+            )
             next_logits = logits[:, -1, :]  # last position
 
             if temperature <= 0:
@@ -227,9 +371,13 @@ class MaskedTransformer(nn.Module):
                 probs = torch.softmax(next_logits, dim=-1)
                 next_token = torch.multinomial(probs, 1)
 
+            # Once a sequence has emitted EOS, keep it at pad so later steps cannot
+            # append spurious tokens to an answer that already ended.
+            next_token = next_token.masked_fill(finished.unsqueeze(1), self.pad_token_id)
             generated = torch.cat([generated, next_token], dim=1)
+            finished = finished | next_token.squeeze(1).eq(eos_token_id)
 
-            if (next_token == eos_token_id).all():
+            if finished.all():
                 break
 
         return generated

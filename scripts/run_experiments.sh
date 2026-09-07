@@ -30,29 +30,34 @@ TIME="${TIME:-48:00:00}"
 CONDA_ENV="${CONDA_ENV:-ruler}"
 
 # ====================== MODEL ================================================
-D_MODEL=512
+D_MODEL=1024
 NUM_HEADS=8
 NUM_LAYERS=8
 D_FF=2048
-DROPOUT=0.1
-MAX_LEN=8192               # PE buffer length (must >= longest TRAIN seq length)
+DROPOUT=0.2
+MAX_LEN=16384     # PE buffer length (must be >= longest EVAL seq length)
 TOKENIZER="gpt2"
 
 # ====================== DATA =================================================
-TRAIN_SEQ_LENGTHS=(4096)    # seq lengths for training data
-TRAIN_SAMPLES=500           # samples per task per seq length
+# Length-generalisation design: train at one length, evaluate at multiples of it.
+# Every eval length must stay <= MAX_LEN. The sinusoidal, learned and rotary buffers
+# are all sized by MAX_LEN and now raise a clear error rather than failing obscurely
+# past the end of the table.
+TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
+TRAIN_SAMPLES=2000          # samples per task per seq length
 TRAIN_SEED=0                # separate seed to avoid data leakage
 
-EVAL_SEQ_LENGTHS=(4096 8192 16384 32768)
+EVAL_SEQ_LENGTHS=(4096 6144 8192)   # 2x, 3x, 4x the training length
 EVAL_SAMPLES=500
 EVAL_SEED=42                # RULER default
 
 # ====================== TRAINING =============================================
-EPOCHS=10
+EPOCHS=20
 BATCH_SIZE=8
-LR=3e-4
+GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
+LR=1e-4
 WARMUP=1000
-SRC_LEN=4096                # max encoder tokens during training
+SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 SEED=42
 
@@ -66,7 +71,7 @@ source "${SCRIPT_DIR}/config_tasks.sh"
 TASKS=("${synthetic[@]}")
 
 # ====================== PATHS ================================================
-EXP_ROOT="${SCRIPT_DIR}/../experiments"
+EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
 LOG_DIR="${EXP_ROOT}/slurm_logs"
 TRAIN_SCRIPT="${SCRIPT_DIR}/tmodel/train.py"
 
@@ -87,31 +92,106 @@ if $SUMMARY; then
     echo "pe_type,encoder_mask,decoder_mask,seq_length,task,score"
     for dir in "${EXP_ROOT}"/results/pe_*/synthetic/*/pred; do
         [ -f "${dir}/summary.csv" ] || continue
-        # parse path: .../pe_X_encY_decZ/synthetic/SEQ/pred/summary.csv
-        cfg=$(echo "$dir" | grep -oP 'pe_[^/]+')
-        seq=$(echo "$dir" | grep -oP 'synthetic/\K[0-9]+')
-        pe=$(echo "$cfg"  | sed 's/pe_\(.*\)_enc.*/\1/')
-        enc=$(echo "$cfg" | sed 's/.*_enc\(.\)_.*/\1/')
-        dec=$(echo "$cfg" | sed 's/.*_dec\(.\)/\1/')
-        # read CSV columns (row 0 = task names, row 1 = scores)
+        # Parse path: .../pe_<PE>_enc<E>_dec<D>/synthetic/<SEQ>/pred/summary.csv
+        # Shell parameter expansion only -- `grep -oP` is GNU-specific and is not
+        # available in the BSD grep shipped with macOS.
+        seq_dir="${dir%/pred}"          # .../synthetic/<SEQ>
+        seq="${seq_dir##*/}"            # <SEQ>
+        cfg_dir="${seq_dir%/*}"         # .../synthetic
+        cfg_dir="${cfg_dir%/*}"         # .../pe_<PE>_enc<E>_dec<D>
+        cfg="${cfg_dir##*/}"            # pe_<PE>_enc<E>_dec<D>
+        rest="${cfg#pe_}"               # <PE>_enc<E>_dec<D>
+        pe="${rest%_enc*}"              # <PE>
+        enc_dec="${rest#*_enc}"         # <E>_dec<D>
+        enc="${enc_dec%%_*}"            # <E>
+        dec="${cfg##*_dec}"             # <D>
+        # summary.csv is a transposed frame written by eval/evaluate.py, so its first
+        # line is pandas' integer column header and the task names are on line 2:
+        #   0,1,2,...
+        #   Tasks,<task>,...
+        #   Score,<score>,...
+        #   Nulls,<n>/<total>,...
         python3 -c "
 import csv, sys
 with open('${dir}/summary.csv') as f:
     rows = list(csv.reader(f))
-tasks  = rows[0][1:]
-scores = rows[1][1:]
+by_label = {r[0]: r[1:] for r in rows if r}
+tasks  = by_label.get('Tasks', [])
+scores = by_label.get('Score', [])
+if not tasks:
+    sys.exit(f'malformed summary: ${dir}/summary.csv')
 for t, s in zip(tasks, scores):
     print(f'${pe},${enc},${dec},${seq},{t},{s}')
-" 2>/dev/null
+"
     done
     exit 0
 fi
 
 mkdir -p "${LOG_DIR}"
 
+# ====================== FETCH SOURCE CORPORA =================================
+# The needle tasks read Paul Graham essays and the QA tasks read SQuAD/HotpotQA.
+# None of the three ships with the repository, and without them data generation
+# fails on a missing file. Idempotent: existing files are left alone.
+CORPUS_DIR="${SCRIPT_DIR}/data/synthetic/json"
+
+fetch_corpora() {
+    echo "--- Checking source corpora in ${CORPUS_DIR} ---"
+    local need_essay=false need_qa=false
+    [ -f "${CORPUS_DIR}/PaulGrahamEssays.json" ] || need_essay=true
+    { [ -f "${CORPUS_DIR}/squad.json" ] && [ -f "${CORPUS_DIR}/hotpotqa.json" ]; } || need_qa=true
+
+    if ! $need_essay && ! $need_qa; then
+        echo "    all corpora present, skipping download"
+        return 0
+    fi
+
+    ( cd "${CORPUS_DIR}" || exit 1
+      if $need_essay; then
+          echo "    downloading Paul Graham essays ..."
+          python download_paulgraham_essay.py
+      fi
+      if $need_qa; then
+          echo "    downloading SQuAD and HotpotQA ..."
+          bash download_qa_dataset.sh
+      fi
+    )
+
+    for f in PaulGrahamEssays.json squad.json hotpotqa.json; do
+        if [ ! -f "${CORPUS_DIR}/${f}" ]; then
+            echo "ERROR: ${CORPUS_DIR}/${f} is still missing after download." >&2
+            exit 1
+        fi
+    done
+    echo "    corpora ready"
+}
+
 # ====================== GENERATE SHARED TRAINING DATA ========================
 # Training data is the same for all configs — generate once with seed=0.
 TRAIN_DATA_DIR="${EXP_ROOT}/train_data"
+# Eval data depends only on (length, task, seed) and the seed is fixed, so all 15
+# cells would otherwise regenerate byte-identical files. Generate once and share.
+EVAL_DATA_ROOT="${EXP_ROOT}/eval_data"
+
+generate_eval_data() {
+    echo "--- Generating RULER eval data (seed=${EVAL_SEED}) ---"
+    for SEQ_LEN in "${EVAL_SEQ_LENGTHS[@]}"; do
+        local DATA_DIR="${EVAL_DATA_ROOT}/${SEQ_LEN}/data"
+        mkdir -p "${DATA_DIR}"
+        for TASK in "${TASKS[@]}"; do
+            python "${SCRIPT_DIR}/data/prepare.py" \
+                --save_dir   "${DATA_DIR}" \
+                --benchmark  synthetic \
+                --task       "${TASK}" \
+                --tokenizer_path "${TOKENIZER}" \
+                --tokenizer_type hf \
+                --max_seq_length "${SEQ_LEN}" \
+                --model_template_type base \
+                --num_samples "${EVAL_SAMPLES}" \
+                --random_seed "${EVAL_SEED}"
+        done
+    done
+}
 
 generate_train_data() {
     echo "--- Generating RULER training data (seed=${TRAIN_SEED}) ---"
@@ -160,6 +240,7 @@ run_experiment() {
         --tgt_len      "${TGT_LEN}" \
         --epochs       "${EPOCHS}" \
         --batch_size   "${BATCH_SIZE}" \
+        --grad_accum   "${GRAD_ACCUM}" \
         --lr           "${LR}" \
         --warmup_steps "${WARMUP}" \
         --seed         "${SEED}" \
@@ -169,23 +250,12 @@ run_experiment() {
     # ---- Phase 2: Evaluate at each RULER sequence length ------------------
     for SEQ_LEN in "${EVAL_SEQ_LENGTHS[@]}"; do
         local RESULTS="${EXP_ROOT}/results/${EXP_NAME}/synthetic/${SEQ_LEN}"
-        local EVAL_DATA="${RESULTS}/data"
+        # Read the shared eval data rather than regenerating it per configuration.
+        local EVAL_DATA="${EVAL_DATA_ROOT}/${SEQ_LEN}/data"
         local PRED_DIR="${RESULTS}/pred"
-        mkdir -p "${EVAL_DATA}" "${PRED_DIR}"
+        mkdir -p "${PRED_DIR}"
 
         for TASK in "${TASKS[@]}"; do
-            # generate eval data (default seed=42)
-            python "${SCRIPT_DIR}/data/prepare.py" \
-                --save_dir   "${EVAL_DATA}" \
-                --benchmark  synthetic \
-                --task       "${TASK}" \
-                --tokenizer_path "${TOKENIZER}" \
-                --tokenizer_type hf \
-                --max_seq_length "${SEQ_LEN}" \
-                --model_template_type base \
-                --num_samples "${EVAL_SAMPLES}" \
-                --random_seed "${EVAL_SEED}"
-
             # predict
             python "${SCRIPT_DIR}/pred/call_api.py" \
                 --data_dir  "${EVAL_DATA}" \
@@ -209,6 +279,42 @@ run_experiment() {
     echo "=== Done: ${EXP_NAME} ==="
 }
 
+# ====================== SHARED DATA PREP JOB =================================
+# Training and eval data are identical across all 15 cells. Generating them inside
+# every job would have 15 processes writing the same files concurrently, and
+# prepare.py's "skip if the file exists" check is not atomic. Submit one prep job
+# instead and make every experiment depend on it.
+PREP_JOB_ID=""
+if ! $LOCAL && ! $DRY_RUN; then
+    PREP_JOB_ID=$(sbatch --parsable \
+        --job-name="ruler_data_prep" \
+        --partition="${PARTITION}" \
+        --cpus-per-task="${CPUS}" \
+        --mem="${MEM}" \
+        --time="${TIME}" \
+        --output="${LOG_DIR}/data_prep_%j.out" \
+        --error="${LOG_DIR}/data_prep_%j.err" \
+        <<PREP_EOF
+#!/bin/bash
+set -euo pipefail
+if command -v conda &>/dev/null; then
+    eval "\$(conda shell.bash hook)"
+    conda activate ${CONDA_ENV}
+fi
+$(declare -f fetch_corpora)
+$(declare -f generate_train_data)
+$(declare -f generate_eval_data)
+$(declare -p SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+             TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
+             EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+fetch_corpora
+generate_train_data
+generate_eval_data
+PREP_EOF
+    )
+    echo "  -> submitted data prep job ${PREP_JOB_ID}"
+fi
+
 # ====================== DISPATCH LOOP ========================================
 n_jobs=0
 
@@ -218,8 +324,12 @@ for pe in "${PE_TYPES[@]}"; do
         EXP_NAME="pe_${pe}_enc${enc_mask}_dec${dec_mask}"
 
         if $LOCAL; then
-            # ---------- local: generate data once, then run each experiment ---
-            if [ $n_jobs -eq 0 ]; then generate_train_data; fi
+            # ---------- local: prepare shared data once, then run each experiment ---
+            if [ $n_jobs -eq 0 ]; then
+                fetch_corpora
+                generate_train_data
+                generate_eval_data
+            fi
             run_experiment "${pe}" "${enc_mask}" "${dec_mask}"
             n_jobs=$((n_jobs + 1))
             continue
@@ -239,6 +349,7 @@ for pe in "${PE_TYPES[@]}"; do
             --cpus-per-task="${CPUS}" \
             --mem="${MEM}" \
             --time="${TIME}" \
+            --dependency="afterok:${PREP_JOB_ID}" \
             --output="${LOG_DIR}/${EXP_NAME}_%j.out" \
             --error="${LOG_DIR}/${EXP_NAME}_%j.err" \
             <<SLURM_EOF
@@ -251,14 +362,14 @@ fi
 
 echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
 
-# Generate training data (idempotent — skips if files exist)
-$(declare -f generate_train_data)
-$(declare -p TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TASKS TRAIN_SAMPLES TRAIN_SEED SCRIPT_DIR TOKENIZER 2>/dev/null)
-generate_train_data
-
-# Run experiment
+# Data is produced by the prep job this one depends on; nothing to generate here.
+# NOTE: no 2>/dev/null on declare -p. Silently dropping an unset variable here would
+# surface much later as an empty path or a skipped flag inside the job.
 $(declare -f run_experiment)
-$(declare -p EXP_ROOT TRAIN_DATA_DIR TRAIN_SCRIPT D_MODEL NUM_HEADS NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS BATCH_SIZE LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED TASKS SCRIPT_DIR 2>/dev/null)
+$(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
+             NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
+             BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
+             EVAL_SEED TASKS SCRIPT_DIR)
 run_experiment "${pe}" "${enc_mask}" "${dec_mask}"
 SLURM_EOF
 

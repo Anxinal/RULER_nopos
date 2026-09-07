@@ -12,6 +12,7 @@ Building blocks
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 from .PositionalEmbeddings import PositionalEmbedding
@@ -28,7 +29,14 @@ class MultiHeadAttention(nn.Module):
 
     * **additive** -- PE already summed into the input; nothing extra here.
     * **rotary**   -- Q and K are rotated before the dot product.
-    * **alibi**    -- a per-head linear bias is added to the logits.
+    * **alibi**    -- a per-head linear bias is folded into ``attn_bias`` by the caller.
+
+    Attention is computed with :func:`torch.nn.functional.scaled_dot_product_attention`,
+    so the ``[batch, heads, q_len, k_len]`` weight matrix is never materialised or stored
+    for the backward pass. Everything that would previously have been added to the logits
+    -- the causal / future-only mask, the ALiBi bias, and the key padding mask -- arrives
+    pre-combined in ``attn_bias``, built once per forward pass by
+    :class:`~transformer.MaskedTransformer` rather than once per layer.
 
     Args:
         d_model:   model / embedding dimension.
@@ -55,7 +63,7 @@ class MultiHeadAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
         pe: Optional[PositionalEmbedding] = None,
         is_cross_attention: bool = False,
     ) -> torch.Tensor:
@@ -64,11 +72,13 @@ class MultiHeadAttention(nn.Module):
             query: ``[batch, q_len, d_model]``
             key:   ``[batch, k_len, d_model]``
             value: ``[batch, k_len, d_model]``
-            attn_mask: broadcastable to ``[batch, heads, q_len, k_len]``
-                       with 0 = attend, -inf = block.
-            pe: optional positional embedding (RoPE / ALiBi applied here).
-            is_cross_attention: if ``True``, skip RoPE and ALiBi (different
-                                sequences have incompatible position spaces).
+            attn_bias: additive bias broadcastable to ``[batch, heads, q_len, k_len]``,
+                       already combining the attention mask, the ALiBi bias and the key
+                       padding mask. ``0`` = attend, large negative = block.
+            pe: optional positional embedding. Only RoPE is applied here; ALiBi is
+                folded into *attn_bias* by the caller.
+            is_cross_attention: if ``True``, skip RoPE (the two sequences have
+                                incompatible position spaces).
         """
         bsz, q_len, _ = query.shape
         k_len = key.shape[1]
@@ -82,24 +92,20 @@ class MultiHeadAttention(nn.Module):
         if pe is not None and pe.pe_type == "rotary" and not is_cross_attention:
             q, k = pe.rotate_queries_and_keys(q, k)
 
-        # Scaled dot-product
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # SDPA requires the mask dtype to match the query dtype. The caller builds the
+        # bias in the right dtype already, so this is normally a no-op; it is kept as a
+        # guard for direct callers and for autocast edge cases.
+        if attn_bias is not None and attn_bias.dtype != q.dtype:
+            attn_bias = attn_bias.to(q.dtype)
 
-        # ALiBi bias (self-attention only)
-        if pe is not None and pe.pe_type == "alibi" and not is_cross_attention:
-            bias = pe.attention_bias(q_len, k_len, self.num_heads, q.device)
-            if bias is not None:
-                attn_weights = attn_weights + bias.unsqueeze(0)  # broadcast batch
-
-        # Attention mask (causal / future / custom)
-        if attn_mask is not None:
-            attn_weights = attn_weights + attn_mask
-
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        # SDPA applies the 1/sqrt(head_dim) scaling itself, so self.scale is not applied.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+        )
 
         # Combine heads
-        out = torch.matmul(attn_weights, v)
         out = out.transpose(1, 2).contiguous().view(bsz, q_len, self.d_model)
         return self.out_proj(out)
 
@@ -143,12 +149,12 @@ class TransformerEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
         pe: Optional[PositionalEmbedding] = None,
     ) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
-        x = self.self_attn(x, x, x, attn_mask=attn_mask, pe=pe)
+        x = self.self_attn(x, x, x, attn_bias=attn_bias, pe=pe)
         x = self.dropout1(x) + residual
 
         residual = x
@@ -187,9 +193,9 @@ class TransformerEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
         pe: Optional[PositionalEmbedding] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, attn_mask=attn_mask, pe=pe)
+            x = layer(x, attn_bias=attn_bias, pe=pe)
         return self.final_norm(x)

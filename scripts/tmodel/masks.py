@@ -101,3 +101,59 @@ class BidirectionalMask(Mask):
 
     def _build(self, dim: int) -> torch.Tensor:
         return torch.zeros(dim, dim)
+
+
+# ---------------------------------------------------------------------------
+# Cached additive masks
+# ---------------------------------------------------------------------------
+
+_MASK_CACHE = {}
+
+
+def build_additive_mask(mask_type: str, dim: int, device, dtype) -> torch.Tensor:
+    """Return a cached ``[dim, dim]`` additive mask, or ``None`` for bidirectional.
+
+    Two differences from instantiating a :class:`Mask` directly, both of which matter
+    in the training/inference hot path:
+
+    * **Cached.** Building the tensor fresh on every forward pass costs a 268 MB
+      allocation at ``dim=8192``. The cache is keyed on shape, device and dtype, and
+      the number of distinct keys is bounded by the experiment grid.
+    * **Finite.** Masked positions hold ``torch.finfo(dtype).min`` rather than ``-inf``.
+      A row that ends up fully masked -- which happens with the future-only mask when a
+      padded query position can only see later positions that are themselves padding --
+      would otherwise softmax to NaN. A NaN at a padded position is not harmless: the
+      decoder's cross-attention multiplies it by a zero weight, and ``0 * NaN`` is NaN,
+      so it would propagate into real positions. Finite values soften such a row to a
+      uniform distribution instead, and its output is discarded downstream anyway.
+
+    Args:
+        mask_type: ``"B"`` bidirectional, ``"C"`` causal, ``"F"`` future-only.
+        dim:       sequence length.
+        device:    target device.
+        dtype:     target floating dtype (must match the attention query dtype).
+
+    Returns:
+        ``[dim, dim]`` additive mask, or ``None`` when ``mask_type`` is ``"B"``.
+    """
+    if mask_type == "B":
+        return None  # bidirectional: nothing to add
+
+    key = (mask_type, dim, str(device), dtype)
+    cached = _MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    mask_cls = Mask.convert_from_config(mask_type)
+    tensor = mask_cls(dim).tensor  # float32, -inf in masked positions
+    neg = torch.finfo(dtype).min
+    tensor = torch.nan_to_num(tensor, neginf=neg).to(device=device, dtype=dtype)
+    tensor = tensor.clamp_min(neg)
+
+    _MASK_CACHE[key] = tensor
+    return tensor
+
+
+def clear_mask_cache() -> None:
+    """Drop every cached mask. Mainly useful in tests and to release device memory."""
+    _MASK_CACHE.clear()

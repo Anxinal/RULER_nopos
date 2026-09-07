@@ -31,6 +31,7 @@ python prepare.py \
     --num_samples 10 \
 """
 import os
+import sys
 import argparse
 import importlib
 import subprocess
@@ -154,7 +155,20 @@ def main():
                 print("Error:")
                 print(result.stderr)
         except subprocess.CalledProcessError as e:
-            print("Error output:", e.stderr)
+            # Do not swallow this. A failed generator writes no file, and continuing
+            # turns a clear error here into a confusing "Prediction file not found"
+            # much later in the pipeline -- or, worse, a silently short dataset.
+            print("Error output:", e.stderr, file=sys.stderr)
+            raise SystemExit(
+                f"Data generation failed for task '{args.task}' at "
+                f"max_seq_length={args.max_seq_length} (exit code {e.returncode}). "
+                f"See the generator stderr above."
+            )
+
+    if not os.path.exists(save_file):
+        raise SystemExit(
+            f"Data generation reported success but {save_file} does not exist."
+        )
 
         print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")
         print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")

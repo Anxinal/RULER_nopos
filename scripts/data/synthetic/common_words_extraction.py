@@ -77,16 +77,38 @@ words = sorted(list(set(words)))
 random.Random(args.random_seed).shuffle(words)
 logger.info(f'loaded {len(words)} wonderwords')
 
-# Randleword english words
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "json/english_words.json") , "r") as f:
-    randle_words = list(json.load(f).values())
-    logger.info(f'loaded {len(randle_words)} randle words')
+# Randleword english words.
+# This file is tracked with Git LFS. In a clone without `git lfs pull` it is a small
+# text pointer rather than JSON, and loading it eagerly used to abort the whole task at
+# import time. It is only needed as an overflow vocabulary when a single sample wants
+# more distinct words than wonderwords provides (tens of thousands), which does not
+# happen at the sequence lengths this benchmark uses. So load it lazily and only fail
+# if it is genuinely required.
+_RANDLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json/english_words.json")
+randle_words = None
+
+
+def _load_randle_words():
+    global randle_words
+    if randle_words is None:
+        try:
+            with open(_RANDLE_PATH, "r") as f:
+                randle_words = list(json.load(f).values())
+            logger.info(f'loaded {len(randle_words)} randle words')
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise SystemExit(
+                f"{_RANDLE_PATH} is not valid JSON. It is a Git LFS pointer file, which "
+                f"means the LFS content was never fetched. Install git-lfs and run "
+                f"`git lfs pull` in the repository root."
+            )
+    return randle_words
+
 
 def get_example(num_words, common_repeats=30, uncommon_repeats=3, common_nums=10):
     if num_words <= len(words):
         word_list_full = random.sample(words, num_words)
     else:
-        word_list_full = random.sample(randle_words, num_words)
+        word_list_full = random.sample(_load_randle_words(), num_words)
 
     common, uncommon = word_list_full[:common_nums], word_list_full[common_nums:]
     word_list = common * int(common_repeats) + uncommon * int(uncommon_repeats)
@@ -143,8 +165,13 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_words = int(max_seq_length // tokens_per_words) * 2
 
-    # Binary search for optimal haystack size
-    lower_bound = incremental
+    # Binary search for optimal haystack size.
+    # NOTE: the lower bound must not be `incremental`. If it is and even that smallest
+    # size overflows the budget (which happens at short --max_seq_length), the search
+    # returns nothing, `num_words` falls back to `incremental`, and the size-reduction
+    # loop below can never decrement -- an unrecoverable silent hang.
+    # Floor at num_cw + 1 so there is always at least one uncommon word to contrast with.
+    lower_bound = args.num_cw + 1
     upper_bound = max(estimated_max_words, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_words = None
@@ -166,7 +193,13 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
             # Too large, need to go smaller
             upper_bound = mid - 1
 
-    num_words = optimal_num_words if optimal_num_words is not None else incremental
+    if optimal_num_words is None:
+        raise RuntimeError(
+            f"common_words_extraction/{args.save_name}: cannot fit even {lower_bound} words "
+            f"within max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}). "
+            f"Raise --max_seq_length."
+        )
+    num_words = optimal_num_words
     logger.info(f'Final optimal haystack size (number of haystack): {num_words}')
 
 
@@ -180,8 +213,13 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                if used_words > incremental:
-                    used_words -= incremental
+                # Decrement toward a floor and fail loudly rather than spinning forever.
+                if used_words <= args.num_cw + 1:
+                    raise RuntimeError(
+                        f"common_words_extraction/{args.save_name}: sample {index} does not fit "
+                        f"within max_seq_length={max_seq_length} at the minimum word count."
+                    )
+                used_words = max(args.num_cw + 1, used_words - incremental)
 
         if args.remove_newline_tab:
             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())

@@ -63,15 +63,24 @@ class RulerDataset(Dataset):
 
     Walks *data_dir* for every ``.jsonl`` file, reads ``input`` / ``outputs``
     pairs, and tokenizes them on the fly.
+
+    The source string is ``input`` **plus** ``answer_prefix``. The task generators
+    split the prefix out of ``input`` into its own field, and the prediction path
+    concatenates it back on before calling the model (see ``pred/call_api.py``).
+    Reading ``input`` alone here would train the model on a prompt that never occurs
+    at evaluation time.
     """
 
-    def __init__(self, data_dir, tokenizer, max_src_len=4096, max_tgt_len=128):
+    def __init__(self, data_dir, tokenizer, max_src_len=2048, max_tgt_len=128):
         self.tokenizer = tokenizer
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
-        self.pad_id = tokenizer.pad_token_id or 0
+        self.pad_id = tokenizer.pad_token_id
+        self.bos_id = tokenizer.bos_token_id
+        self.eos_id = tokenizer.eos_token_id
         self.samples = []
 
+        n_missing_prefix = 0
         pattern = os.path.join(data_dir, "**", "*.jsonl")
         for fpath in sorted(glob.glob(pattern, recursive=True)):
             with open(fpath, encoding="utf-8") as f:
@@ -79,9 +88,17 @@ class RulerDataset(Dataset):
                     item = json.loads(line)
                     outputs = item.get("outputs", [])
                     if outputs and outputs[0]:
-                        self.samples.append((item["input"], outputs[0]))
+                        prefix = item.get("answer_prefix", "")
+                        if not prefix:
+                            n_missing_prefix += 1
+                        self.samples.append((item["input"] + prefix, outputs[0]))
 
         log.info("RulerDataset: loaded %d samples from %s", len(self.samples), data_dir)
+        if n_missing_prefix:
+            log.warning(
+                "RulerDataset: %d samples had no answer_prefix field; those prompts will "
+                "not match the ones used at prediction time.", n_missing_prefix,
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -90,8 +107,13 @@ class RulerDataset(Dataset):
         src_text, tgt_text = self.samples[idx]
         src_ids = self.tokenizer.encode(src_text, truncation=True,
                                         max_length=self.max_src_len)
+        # Reserve two slots for the BOS/EOS wrapper below.
         tgt_ids = self.tokenizer.encode(tgt_text, truncation=True,
-                                        max_length=self.max_tgt_len)
+                                        max_length=max(1, self.max_tgt_len - 2))
+        # Wrap the target so the shift in the training loop teaches the model both to
+        # start from BOS (which is what generation feeds it) and to emit EOS (which is
+        # what tells generation to stop).
+        tgt_ids = [self.bos_id] + tgt_ids + [self.eos_id]
         return torch.tensor(src_ids, dtype=torch.long), \
                torch.tensor(tgt_ids, dtype=torch.long)
 
@@ -166,21 +188,33 @@ def cosine_with_warmup(optimizer, warmup: int, total: int):
 # ------------------------------------------------------------------
 
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
-              scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0):
-    """Run one training or validation epoch.  Pass *optimizer=None* for eval."""
+              scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
+              accum_steps=1):
+    """Run one training or validation epoch.  Pass *optimizer=None* for eval.
+
+    ``accum_steps`` batches are accumulated before each optimizer step, so the
+    effective batch size is ``batch_size * accum_steps`` at the memory cost of one
+    batch. The learning-rate scheduler advances once per optimizer step, not once
+    per batch.
+    """
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
     total_tokens = 0
     use_amp = scaler is not None
-    ctx = torch.cuda.amp.autocast(enabled=use_amp)
+    n_batches = len(loader)
+
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
 
     for step, (src, tgt) in enumerate(loader, 1):
         src, tgt = src.to(device), tgt.to(device)
         tgt_in = tgt[:, :-1]
         tgt_out = tgt[:, 1:]
 
-        with ctx:
+        # A fresh autocast context per batch; reusing one instance across the loop
+        # relies on re-entrancy that is not guaranteed.
+        with torch.cuda.amp.autocast(enabled=use_amp):
             logits = model(src, tgt_in)
             loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
 
@@ -189,26 +223,33 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
         total_tokens += n_tok
 
         if is_train:
+            # Scale down so accumulated gradients average rather than sum.
+            scaled_loss = loss / accum_steps
             if scaler:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            if scheduler:
-                scheduler.step()
+                scaled_loss.backward()
+
+            is_last_batch = step == n_batches
+            if step % accum_steps == 0 or is_last_batch:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler:
+                    scheduler.step()
 
             if step % log_every == 0:
                 avg = total_loss / max(total_tokens, 1)
                 ppl = math.exp(min(avg, 20))
                 cur_lr = scheduler.get_last_lr()[0] if scheduler else lr
-                log.info("  step %5d | loss %.4f | ppl %7.1f | lr %.2e",
-                         step, avg, ppl, cur_lr)
+                log.info("  step %5d/%d | loss %.4f | ppl %7.1f | lr %.2e",
+                         step, n_batches, avg, ppl, cur_lr)
 
     return total_loss / max(total_tokens, 1)
 
@@ -265,10 +306,29 @@ def main(args):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    # GPT-2 ships no pad token. Aliasing pad to EOS (the previous behaviour) makes the
+    # pad id, the BOS id and the EOS id all the same token -- and since the loss ignores
+    # the pad id, the model could never be taught to emit EOS and so never learned to
+    # stop. Add a dedicated pad token instead.
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    vocab_size = tokenizer.vocab_size
-    pad_id = tokenizer.pad_token_id or 0
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    if tokenizer.bos_token is None:
+        tokenizer.bos_token = tokenizer.eos_token
+
+    # NOTE: len(tokenizer) counts added special tokens; tokenizer.vocab_size does not.
+    # The embedding must be sized from the former or the new pad id is out of range.
+    vocab_size = len(tokenizer)
+    pad_id = tokenizer.pad_token_id
+    if pad_id == tokenizer.eos_token_id:
+        raise ValueError(
+            "pad_token_id must differ from eos_token_id, otherwise the loss ignores "
+            "every EOS and the model cannot learn to stop generating."
+        )
+    log.info(
+        "Tokenizer: vocab=%d pad=%d bos=%d eos=%d",
+        vocab_size, pad_id, tokenizer.bos_token_id, tokenizer.eos_token_id,
+    )
 
     # ---- model ----------------------------------------------------
     model = MaskedTransformer(
@@ -296,8 +356,16 @@ def main(args):
     # ---- optimiser ------------------------------------------------
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay, betas=(0.9, 0.98))
-    total_steps = len(train_loader) * args.epochs
+    # The scheduler counts optimizer steps, not batches, so accumulation divides it.
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = steps_per_epoch * args.epochs
     warmup = min(args.warmup_steps, total_steps // 10)
+    log.info(
+        "Schedule: %d batches/epoch | accum %d -> %d steps/epoch | %d total | warmup %d "
+        "| effective batch %d",
+        len(train_loader), args.grad_accum, steps_per_epoch, total_steps, warmup,
+        args.batch_size * args.grad_accum,
+    )
     scheduler = cosine_with_warmup(optimizer, warmup, total_steps)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
 
@@ -308,6 +376,19 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
+    # Save the tokenizer beside the checkpoint. It carries the added pad token, so
+    # rebuilding it from the bare model name at inference would give a different
+    # vocabulary size and a different pad id.
+    tokenizer.save_pretrained(args.output_dir)
+
+    # Recorded in every checkpoint so the prediction path can rebuild the model exactly
+    # rather than re-deriving these from a tokenizer it constructed independently.
+    token_config = dict(
+        vocab_size=vocab_size,
+        pad_token_id=pad_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
     # ---- train ----------------------------------------------------
     best_val = float("inf")
@@ -319,7 +400,7 @@ def main(args):
                                optimizer=optimizer, scheduler=scheduler,
                                scaler=scaler if use_amp else None,
                                grad_clip=args.grad_clip, log_every=args.log_every,
-                               lr=args.lr)
+                               lr=args.lr, accum_steps=args.grad_accum)
         with torch.no_grad():
             val_loss = run_epoch(model, val_loader, criterion, vocab_size, device)
         elapsed = time.time() - t0
@@ -332,7 +413,7 @@ def main(args):
         # checkpoint
         ckpt = dict(epoch=epoch, model=model.state_dict(),
                     optimizer=optimizer.state_dict(), val_loss=val_loss,
-                    args=vars(args))
+                    args=vars(args), **token_config)
         torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
         if val_loss < best_val:
             best_val = val_loss
@@ -377,7 +458,7 @@ def parse_args():
     g.add_argument("--dataset", default="wikitext",
                    help="HuggingFace dataset name (for --data_format text)")
     g.add_argument("--dataset_subset", default="wikitext-103-raw-v1")
-    g.add_argument("--src_len", type=int, default=4096,
+    g.add_argument("--src_len", type=int, default=2048,
                    help="Max encoder input length (tokens)")
     g.add_argument("--tgt_len", type=int, default=128,
                    help="Max decoder target length (tokens)")
@@ -388,6 +469,9 @@ def parse_args():
     g = p.add_argument_group("training")
     g.add_argument("--epochs", type=int, default=10)
     g.add_argument("--batch_size", type=int, default=8)
+    g.add_argument("--grad_accum", type=int, default=1,
+                   help="Batches to accumulate before each optimizer step. Effective "
+                        "batch size is batch_size * grad_accum.")
     g.add_argument("--lr", type=float, default=3e-4)
     g.add_argument("--weight_decay", type=float, default=0.01)
     g.add_argument("--grad_clip", type=float, default=1.0)

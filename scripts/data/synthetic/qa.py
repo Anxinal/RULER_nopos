@@ -165,8 +165,13 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_docs = int((max_seq_length / tokens_per_doc) * 3)
 
-    # Binary search for optimal haystack size
-    lower_bound = incremental
+    # Binary search for optimal haystack size.
+    # NOTE: the lower bound must be 1, not `incremental`. If it is `incremental` and even
+    # that smallest size overflows the budget (which happens at short --max_seq_length,
+    # since a single SQuAD/HotpotQA paragraph is already ~100-200 tokens), the search
+    # returns nothing, `num_docs` falls back to `incremental`, and the size-reduction
+    # loop below can never decrement -- an unrecoverable silent hang.
+    lower_bound = 1
     upper_bound = max(estimated_max_docs, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_docs = None
@@ -189,7 +194,13 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
             # Too large, need to go smaller
             upper_bound = mid - 1
 
-    num_docs = optimal_num_docs if optimal_num_docs is not None else incremental
+    if optimal_num_docs is None:
+        raise RuntimeError(
+            f"qa/{args.save_name}: cannot fit even a single document within "
+            f"max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}). "
+            f"Raise --max_seq_length."
+        )
+    num_docs = optimal_num_docs
     logger.info(f'Final optimal haystack size (number of docs): {num_docs}')
 
     # Generate samples
@@ -202,8 +213,13 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                if used_docs > incremental:
-                    used_docs -= incremental
+                # Decrement toward a floor of 1 and fail loudly rather than spinning forever.
+                if used_docs <= 1:
+                    raise RuntimeError(
+                        f"qa/{args.save_name}: sample {index} does not fit within "
+                        f"max_seq_length={max_seq_length} even with a single document."
+                    )
+                used_docs = max(1, used_docs - incremental)
 
         if args.remove_newline_tab:
             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())

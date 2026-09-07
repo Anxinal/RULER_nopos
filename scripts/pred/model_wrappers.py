@@ -151,16 +151,35 @@ class MaskedTransformerModel:
         ckpt = torch.load(name_or_path, map_location=self.device, weights_only=False)
         model_args = ckpt["args"]
 
-        # Tokenizer
+        # Tokenizer. Training saves it next to the checkpoint because it carries an
+        # added pad token; rebuilding from the bare model name would give a different
+        # vocabulary size and a different pad id, so prefer the saved copy.
+        ckpt_dir = _os.path.dirname(_os.path.abspath(name_or_path))
         tok_name = model_args.get("tokenizer", "gpt2")
-        self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        if _os.path.exists(_os.path.join(ckpt_dir, "tokenizer_config.json")):
+            self.tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        if self.tokenizer.bos_token is None:
+            self.tokenizer.bos_token = self.tokenizer.eos_token
 
-        # Rebuild model from saved hyper-parameters
+        # Keep the question at the end of a RULER prompt. Everything the model is asked
+        # to answer -- the query and the answer prefix -- sits at the tail, so the
+        # default right-side truncation would silently delete it.
+        self.tokenizer.truncation_side = "left"
+
+        # Rebuild from the checkpoint, not from the tokenizer. These must match the
+        # trained weights exactly, and the tokenizer is only an indirect witness to them.
+        self.vocab_size = ckpt.get("vocab_size", len(self.tokenizer))
+        self.pad_token_id = ckpt.get("pad_token_id", self.tokenizer.pad_token_id)
+        self.bos_token_id = ckpt.get("bos_token_id", self.tokenizer.bos_token_id)
+        self.eos_token_id = ckpt.get("eos_token_id", self.tokenizer.eos_token_id)
+
         self.max_len = model_args.get("max_len", 8192)
         self.model = MaskedTransformer(
-            vocab_size=self.tokenizer.vocab_size,
+            vocab_size=self.vocab_size,
             d_model=model_args["d_model"],
             num_heads=model_args["num_heads"],
             num_encoder_layers=model_args["num_layers"],
@@ -170,7 +189,7 @@ class MaskedTransformerModel:
             encoder_mask_type=model_args["encoder_mask"],
             decoder_mask_type=model_args["decoder_mask"],
             max_len=self.max_len,
-            pad_token_id=self.tokenizer.pad_token_id or 0,
+            pad_token_id=self.pad_token_id,
         )
         self.model.load_state_dict(ckpt["model"])
         self.model.to(self.device).eval()
@@ -179,6 +198,7 @@ class MaskedTransformerModel:
         self.max_new_tokens = generation_kwargs.pop("max_new_tokens", 64)
         self.temperature = generation_kwargs.get("temperature", 0.0)
         self.top_k = generation_kwargs.get("top_k", 0)
+        self.n_truncated = 0
 
     def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
         return self.process_batch([prompt], **kwargs)[0]
@@ -186,16 +206,28 @@ class MaskedTransformerModel:
     def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
         results = []
         for prompt in prompts:
+            # Measure before truncating so the amount dropped can be reported rather
+            # than silently absorbed. Under the configured eval ladder this should
+            # always be zero; a non-zero value means the ladder outgrew max_len.
+            full_len = len(self.tokenizer(prompt, truncation=False).input_ids)
             inputs = self.tokenizer(
                 prompt, return_tensors="pt", truncation=True, max_length=self.max_len,
             )
             input_ids = inputs.input_ids.to(self.device)
+            truncated = max(0, full_len - input_ids.shape[1])
+            if truncated:
+                self.n_truncated += 1
+                logging.warning(
+                    "Prompt truncated by %d tokens (%d -> %d, max_len=%d). The question "
+                    "survives because truncation is left-sided, but context is lost.",
+                    truncated, full_len, input_ids.shape[1], self.max_len,
+                )
 
             output_ids = self.model.generate(
                 input_ids,
                 max_new_tokens=self.max_new_tokens,
-                bos_token_id=self.tokenizer.bos_token_id or self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                bos_token_id=self.bos_token_id,
+                eos_token_id=self.eos_token_id,
                 temperature=self.temperature,
                 top_k=self.top_k,
             )
@@ -206,5 +238,5 @@ class MaskedTransformerModel:
             for s in self.stop:
                 text = text.split(s)[0]
 
-            results.append({"text": [text]})
+            results.append({"text": [text], "truncation": truncated})
         return results
