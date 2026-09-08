@@ -17,8 +17,8 @@ Usage
     # Train on RULER data
     python scripts/tmodel/train.py \\
         --data_format ruler --data_dir experiments/train_data \\
-        --pe_type rope --encoder_mask B --decoder_mask C \\
-        --output_dir experiments/pe_rope_encB_decC
+        --pe_type rope --encoder_mask CCCCFFFF \\
+        --output_dir experiments/pe_rope_encCCCCFFFF
 
     # Train on WikiText
     python scripts/tmodel/train.py \\
@@ -341,14 +341,13 @@ def main(args):
         dropout=args.dropout,
         max_len=args.max_len,
         pe_type=args.pe_type,
-        encoder_mask_type=args.encoder_mask,
-        decoder_mask_type=args.decoder_mask,
+        encoder_mask_spec=args.encoder_mask,
         pad_token_id=pad_id,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    log.info("Model: %.1fM params | pe=%s enc_mask=%s dec_mask=%s",
-             n_params, args.pe_type, args.encoder_mask, args.decoder_mask)
+    log.info("Model: %.1fM params | pe=%s enc_mask=%s (decoder is always causal)",
+             n_params, args.pe_type, model.encoder_mask_spec)
 
     # ---- data -----------------------------------------------------
     train_loader, val_loader = build_dataloaders(args, tokenizer, pad_id)
@@ -439,8 +438,11 @@ def parse_args():
     g = p.add_argument_group("model")
     g.add_argument("--pe_type", default="sinusoidal",
                    choices=["none", "sinusoidal", "learned", "rope", "alibi"])
-    g.add_argument("--encoder_mask", default="B", choices=["B", "C", "F"])
-    g.add_argument("--decoder_mask", default="C", choices=["B", "C", "F"])
+    g.add_argument("--encoder_mask", default="B",
+                   help="Per-head encoder mask spec: one code per attention head, "
+                        "e.g. CCCCFFFF for four causal and four future-only heads. "
+                        "A single code (B/C/F) applies to every head. The decoder "
+                        "is always causal.")
     g.add_argument("--d_model", type=int, default=512)
     g.add_argument("--num_heads", type=int, default=8)
     g.add_argument("--num_layers", type=int, default=8)

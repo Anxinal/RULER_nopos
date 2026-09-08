@@ -63,8 +63,18 @@ SEED=42
 
 # ====================== EXPERIMENT GRID ======================================
 PE_TYPES=("none" "sinusoidal" "learned" "rope" "alibi")
-#   "ENCODER_MASK DECODER_MASK"
-MASK_CONFIGS=("B C" "C C" "F C")
+# Per-head encoder mask specs: one code per attention head (B/C/F), so each entry
+# must be exactly NUM_HEADS characters long. Head order carries no meaning -- heads
+# are concatenated and mixed by one output projection, so only the count of each
+# code matters. The decoder is always causal and is not an axis of this grid.
+MASK_CONFIGS=("BBBBBBBB" "CCCCCCCC" "CCCCFFFF")
+
+for spec in "${MASK_CONFIGS[@]}"; do
+    if [ ${#spec} -ne "${NUM_HEADS}" ]; then
+        echo "ERROR: mask spec '${spec}' has ${#spec} codes but NUM_HEADS=${NUM_HEADS}." >&2
+        exit 1
+    fi
+done
 
 # Task list (must match entries in synthetic.yaml)
 source "${SCRIPT_DIR}/config_tasks.sh"
@@ -89,22 +99,20 @@ done
 
 # ====================== SUMMARY MODE =========================================
 if $SUMMARY; then
-    echo "pe_type,encoder_mask,decoder_mask,seq_length,task,score"
+    echo "pe_type,encoder_mask,seq_length,task,score"
     for dir in "${EXP_ROOT}"/results/pe_*/synthetic/*/pred; do
         [ -f "${dir}/summary.csv" ] || continue
-        # Parse path: .../pe_<PE>_enc<E>_dec<D>/synthetic/<SEQ>/pred/summary.csv
+        # Parse path: .../pe_<PE>_enc<SPEC>/synthetic/<SEQ>/pred/summary.csv
         # Shell parameter expansion only -- `grep -oP` is GNU-specific and is not
         # available in the BSD grep shipped with macOS.
         seq_dir="${dir%/pred}"          # .../synthetic/<SEQ>
         seq="${seq_dir##*/}"            # <SEQ>
         cfg_dir="${seq_dir%/*}"         # .../synthetic
-        cfg_dir="${cfg_dir%/*}"         # .../pe_<PE>_enc<E>_dec<D>
-        cfg="${cfg_dir##*/}"            # pe_<PE>_enc<E>_dec<D>
-        rest="${cfg#pe_}"               # <PE>_enc<E>_dec<D>
+        cfg_dir="${cfg_dir%/*}"         # .../pe_<PE>_enc<SPEC>
+        cfg="${cfg_dir##*/}"            # pe_<PE>_enc<SPEC>
+        rest="${cfg#pe_}"               # <PE>_enc<SPEC>
         pe="${rest%_enc*}"              # <PE>
-        enc_dec="${rest#*_enc}"         # <E>_dec<D>
-        enc="${enc_dec%%_*}"            # <E>
-        dec="${cfg##*_dec}"             # <D>
+        enc="${rest##*_enc}"            # <SPEC>
         # summary.csv is a transposed frame written by eval/evaluate.py, so its first
         # line is pandas' integer column header and the task names are on line 2:
         #   0,1,2,...
@@ -121,7 +129,7 @@ scores = by_label.get('Score', [])
 if not tasks:
     sys.exit(f'malformed summary: ${dir}/summary.csv')
 for t, s in zip(tasks, scores):
-    print(f'${pe},${enc},${dec},${seq},{t},{s}')
+    print(f'${pe},${enc},${seq},{t},{s}')
 "
     done
     exit 0
@@ -215,8 +223,8 @@ generate_train_data() {
 
 # ====================== PER-EXPERIMENT JOB ====================================
 run_experiment() {
-    local pe="$1" enc_mask="$2" dec_mask="$3"
-    local EXP_NAME="pe_${pe}_enc${enc_mask}_dec${dec_mask}"
+    local pe="$1" enc_mask="$2"
+    local EXP_NAME="pe_${pe}_enc${enc_mask}"
     local EXP_DIR="${EXP_ROOT}/${EXP_NAME}"
     local CKPT="${EXP_DIR}/best.pt"
 
@@ -228,7 +236,6 @@ run_experiment() {
         --data_dir     "${TRAIN_DATA_DIR}" \
         --pe_type      "${pe}" \
         --encoder_mask "${enc_mask}" \
-        --decoder_mask "${dec_mask}" \
         --d_model      "${D_MODEL}" \
         --num_heads    "${NUM_HEADS}" \
         --num_layers   "${NUM_LAYERS}" \
@@ -319,9 +326,8 @@ fi
 n_jobs=0
 
 for pe in "${PE_TYPES[@]}"; do
-    for mask_cfg in "${MASK_CONFIGS[@]}"; do
-        read -r enc_mask dec_mask <<< "${mask_cfg}"
-        EXP_NAME="pe_${pe}_enc${enc_mask}_dec${dec_mask}"
+    for enc_mask in "${MASK_CONFIGS[@]}"; do
+        EXP_NAME="pe_${pe}_enc${enc_mask}"
 
         if $LOCAL; then
             # ---------- local: prepare shared data once, then run each experiment ---
@@ -330,7 +336,7 @@ for pe in "${PE_TYPES[@]}"; do
                 generate_train_data
                 generate_eval_data
             fi
-            run_experiment "${pe}" "${enc_mask}" "${dec_mask}"
+            run_experiment "${pe}" "${enc_mask}"
             n_jobs=$((n_jobs + 1))
             continue
         fi
@@ -370,7 +376,7 @@ $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEA
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EVAL_SEED TASKS SCRIPT_DIR)
-run_experiment "${pe}" "${enc_mask}" "${dec_mask}"
+run_experiment "${pe}" "${enc_mask}"
 SLURM_EOF
 
         echo "  -> submitted ${EXP_NAME}"

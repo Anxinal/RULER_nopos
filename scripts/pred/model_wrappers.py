@@ -186,8 +186,7 @@ class MaskedTransformerModel:
             num_decoder_layers=model_args["num_layers"],
             d_ff=model_args["d_ff"],
             pe_type=model_args["pe_type"],
-            encoder_mask_type=model_args["encoder_mask"],
-            decoder_mask_type=model_args["decoder_mask"],
+            encoder_mask_spec=model_args["encoder_mask"],
             max_len=self.max_len,
             pad_token_id=self.pad_token_id,
         )

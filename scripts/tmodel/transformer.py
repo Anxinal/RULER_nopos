@@ -10,12 +10,19 @@ Usage example::
         num_encoder_layers=8,
         num_decoder_layers=8,
         pe_type="sinusoidal",        # none | sinusoidal | learned | rope | alibi
-        encoder_mask_type="B",       # B(idirectional) | C(ausal) | F(uture)
-        decoder_mask_type="C",       # C(ausal) is standard for decoders
+        encoder_mask_spec="CCCCFFFF",  # one code per head: B | C | F
     )
 
     logits = model(src_tokens, tgt_tokens)          # training
     generated = model.generate(src_tokens)           # inference
+
+The encoder mask is a per-head spec: one character per attention head, so
+``"CCCCFFFF"`` gives an eight-head model four causal heads and four future-only heads
+in every encoder layer. A single character applies to every head, so ``"B"`` still
+means fully bidirectional.
+
+The decoder is always causal. Any other setting breaks the autoregressive property
+that generation depends on, so it is a constant rather than a parameter.
 """
 
 import torch
@@ -25,7 +32,10 @@ from typing import Optional
 from .PositionalEmbeddings import build_positional_embedding
 from .transformer_encoder import TransformerEncoder
 from .transformer_decoder import TransformerDecoder
-from .masks import CausalMask, FutureOnlyMask, build_additive_mask
+from .masks import build_head_mask_bias, parse_mask_spec
+
+# The decoder must be able to attend only to what it has already produced.
+DECODER_MASK_TYPE = "C"
 
 
 def _compute_dtype(device: torch.device) -> torch.dtype:
@@ -61,9 +71,11 @@ class MaskedTransformer(nn.Module):
         pe_type:             positional embedding type
                              (``"none"``, ``"sinusoidal"``, ``"learned"``,
                              ``"rope"``, ``"alibi"``).
-        encoder_mask_type:   ``"B"`` bidirectional, ``"C"`` causal,
-                             ``"F"`` future-only.
-        decoder_mask_type:   same codes; ``"C"`` is the standard choice.
+        encoder_mask_spec:   one mask code per attention head, e.g. ``"CCCCFFFF"``
+                             for four causal and four future-only heads. A single
+                             code applies to every head. ``"B"`` bidirectional,
+                             ``"C"`` causal, ``"F"`` future-only. The decoder is
+                             always causal and is not configurable.
         pad_token_id:        token id used for padding.
         tie_weights:         if ``True`` (default), the decoder input
                              embedding and output projection share weights.
@@ -80,8 +92,7 @@ class MaskedTransformer(nn.Module):
         dropout: float = 0.1,
         max_len: int = 8192,
         pe_type: str = "sinusoidal",
-        encoder_mask_type: str = "B",
-        decoder_mask_type: str = "C",
+        encoder_mask_spec: str = "B",
         pad_token_id: int = 0,
         tie_weights: bool = True,
     ):
@@ -91,8 +102,10 @@ class MaskedTransformer(nn.Module):
         self.vocab_size = vocab_size
         self.max_len = max_len
         self.pad_token_id = pad_token_id
-        self.encoder_mask_type = encoder_mask_type
-        self.decoder_mask_type = decoder_mask_type
+        # Validate here rather than on the first forward pass, so a bad grid entry
+        # fails at startup instead of minutes into a training run.
+        self.encoder_mask_codes = parse_mask_spec(encoder_mask_spec, num_heads)
+        self.encoder_mask_spec = "".join(self.encoder_mask_codes)
         self.embed_scale = d_model ** 0.5
 
         # Token embeddings (shared between encoder and decoder)
@@ -137,7 +150,7 @@ class MaskedTransformer(nn.Module):
 
     def _build_attn_bias(
         self,
-        mask_type: Optional[str],
+        mask_spec: Optional[str],
         q_len: int,
         k_len: int,
         device: torch.device,
@@ -149,11 +162,12 @@ class MaskedTransformer(nn.Module):
 
         Built once per forward pass and shared by every layer, rather than reconstructed
         inside each attention call. Shapes are kept broadcastable so nothing is expanded
-        to the full ``[batch, heads, q_len, k_len]`` unless ALiBi genuinely requires a
-        per-head term.
+        to the full ``[batch, heads, q_len, k_len]`` unless a per-head term genuinely
+        requires it, which happens only for ALiBi and for a mixed mask spec.
 
         Args:
-            mask_type: ``"B"``, ``"C"``, ``"F"``, or ``None`` for cross-attention.
+            mask_spec: per-head mask spec such as ``"CCCCFFFF"``, a single code applied
+                to every head, or ``None`` for cross-attention.
             q_len, k_len: query and key lengths.
             device, dtype: must match the attention query tensor.
             key_padding_mask: ``[batch, k_len]`` bool, ``True`` at padded keys.
@@ -165,19 +179,23 @@ class MaskedTransformer(nn.Module):
         """
         neg = torch.finfo(dtype).min
         bias = None
+        n_terms = 0
 
         # Per-head ALiBi term -> [1, heads, q_len, k_len]
         if use_alibi:
             alibi = self.pe.attention_bias(q_len, k_len, self.num_heads, device, dtype)
             if alibi is not None:
                 bias = alibi.unsqueeze(0)
+                n_terms += 1
 
-        # Square causal / future-only mask -> [1, 1, q_len, k_len]
-        if mask_type is not None:
-            mask = build_additive_mask(mask_type, q_len, device, dtype)
+        # Mask, cached: [1, 1, q_len, k_len] if every head shares a code, else
+        # [1, heads, q_len, k_len].
+        if mask_spec is not None:
+            mask = build_head_mask_bias(mask_spec, self.num_heads, q_len, device, dtype)
             if mask is not None:
-                mask = mask[:q_len, :k_len].view(1, 1, q_len, k_len)
+                mask = mask[..., :q_len, :k_len]
                 bias = mask if bias is None else bias + mask
+                n_terms += 1
 
         # Key padding -> [batch, 1, 1, k_len]
         if key_padding_mask is not None:
@@ -185,10 +203,14 @@ class MaskedTransformer(nn.Module):
                 key_padding_mask.shape, device=device, dtype=dtype,
             ).masked_fill(key_padding_mask, neg).view(-1, 1, 1, k_len)
             bias = pad if bias is None else bias + pad
+            n_terms += 1
 
-        if bias is not None:
+        if n_terms > 1:
             # Two finite minima can sum below the dtype's range and become -inf, which
-            # would reintroduce the NaN that finite masking exists to avoid.
+            # would reintroduce the NaN that finite masking exists to avoid. Only a sum
+            # can underflow, so clamping a lone term would buy nothing and cost a full
+            # copy of a tensor that is 1.07 GB at [1, 8, 8192, 8192] in fp16 -- on every
+            # forward pass, defeating the mask cache entirely.
             bias = bias.clamp_min(neg)
         return bias
 
@@ -224,7 +246,7 @@ class MaskedTransformer(nn.Module):
         x = self._embed(src_tokens)
         src_len = src_tokens.shape[1]
         attn_bias = self._build_attn_bias(
-            mask_type=self.encoder_mask_type,
+            mask_spec=self.encoder_mask_spec,
             q_len=src_len,
             k_len=src_len,
             device=src_tokens.device,
@@ -264,7 +286,7 @@ class MaskedTransformer(nn.Module):
         tgt_len = tgt_tokens.shape[1]
 
         self_attn_bias = self._build_attn_bias(
-            mask_type=self.decoder_mask_type,
+            mask_spec=DECODER_MASK_TYPE,
             q_len=tgt_len,
             k_len=tgt_len,
             device=device,
@@ -275,7 +297,7 @@ class MaskedTransformer(nn.Module):
         # Cross-attention carries only the source padding: RoPE and ALiBi are skipped
         # across the two sequences because their position spaces are incompatible.
         cross_attn_bias = self._build_attn_bias(
-            mask_type=None,
+            mask_spec=None,
             q_len=tgt_len,
             k_len=encoder_output.shape[1],
             device=device,
