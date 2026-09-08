@@ -76,6 +76,7 @@ class SinusoidalPositionalEmbedding(PositionalEmbedding):
 
     def __init__(self, d_model: int, max_len: int = 8192):
         super().__init__()
+        self.max_len = max_len
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(
@@ -87,6 +88,13 @@ class SinusoidalPositionalEmbedding(PositionalEmbedding):
         self.register_buffer("pe", pe.unsqueeze(0))  # [1, max_len, d_model]
 
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if seq_len > self.max_len:
+            # Silently returning a short slice would fail later as an opaque broadcast
+            # error inside the residual add, so fail here with the actual numbers.
+            raise ValueError(
+                f"SinusoidalPositionalEmbedding: sequence length {seq_len} exceeds the "
+                f"buffer max_len={self.max_len}. Rebuild the model with a larger max_len."
+            )
         return self.pe[:, :seq_len, :].to(device)
 
 
@@ -97,9 +105,19 @@ class LearnedPositionalEmbedding(PositionalEmbedding):
 
     def __init__(self, d_model: int, max_len: int = 8192):
         super().__init__()
+        self.max_len = max_len
         self.embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if seq_len > self.max_len:
+            # Otherwise this is an out-of-range gather, which on CUDA surfaces as an
+            # asynchronous device-side assert far from the actual cause.
+            raise ValueError(
+                f"LearnedPositionalEmbedding: sequence length {seq_len} exceeds the "
+                f"table size max_len={self.max_len}. Rebuild the model with a larger "
+                f"max_len. Note that positions beyond the training length are untrained "
+                f"regardless, which is inherent to learned absolute positions."
+            )
         positions = torch.arange(seq_len, device=device)
         return self.embedding(positions).unsqueeze(0)  # [1, seq_len, d_model]
 
@@ -116,6 +134,7 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     def __init__(self, d_model: int, num_heads: int, max_len: int = 8192):
         super().__init__()
         self.d_model = d_model
+        self.max_len = max_len
         head_dim = d_model // num_heads
 
         inv_freq = 1.0 / (
@@ -143,6 +162,14 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
         q_len = q.shape[2]
         k_len = k.shape[2]
 
+        if offset + max(q_len, k_len) > self.max_len:
+            # A short slice would fail later as an opaque broadcast error, so be explicit.
+            raise ValueError(
+                f"RotaryPositionalEmbedding: position {offset + max(q_len, k_len)} exceeds "
+                f"the cached table max_len={self.max_len}. Rebuild the model with a larger "
+                f"max_len."
+            )
+
         cos_q = self.cos_cached[offset:offset + q_len].to(q.device)[None, None]
         sin_q = self.sin_cached[offset:offset + q_len].to(q.device)[None, None]
         q_rot = q * cos_q + self._rotate_half(q) * sin_q
@@ -169,6 +196,9 @@ class ALiBiPositionalEmbedding(PositionalEmbedding):
         self.num_heads = num_heads
         slopes = self._get_slopes(num_heads)
         self.register_buffer("slopes", torch.tensor(slopes, dtype=torch.float))
+        # Cache keyed on (q_len, k_len, device, dtype). Without it the bias is rebuilt
+        # once per layer per forward, which at 8192 is a 2 GB allocation each time.
+        self._bias_cache = {}
 
     @staticmethod
     def _get_slopes(num_heads: int) -> List[float]:
@@ -192,13 +222,29 @@ class ALiBiPositionalEmbedding(PositionalEmbedding):
 
     def attention_bias(
         self, q_len: int, k_len: int, num_heads: int, device: torch.device,
+        dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        """``-slope_h * |q_pos - k_pos|``  ->  ``[num_heads, q_len, k_len]``."""
+        """``-slope_h * |q_pos - k_pos|``  ->  ``[num_heads, q_len, k_len]``.
+
+        Cached on ``(q_len, k_len, device, dtype)``; see :meth:`__init__`.
+        """
+        key = (q_len, k_len, str(device), dtype)
+        cached = self._bias_cache.get(key)
+        if cached is not None:
+            return cached
+
         q_pos = torch.arange(k_len - q_len, k_len, device=device, dtype=torch.float)
         k_pos = torch.arange(k_len, device=device, dtype=torch.float)
         distance = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()   # [q, k]
         slopes = self.slopes.to(device)[:, None, None]                # [h, 1, 1]
-        return -slopes * distance.unsqueeze(0)                        # [h, q, k]
+        bias = (-slopes * distance.unsqueeze(0)).to(dtype)            # [h, q, k]
+
+        self._bias_cache[key] = bias
+        return bias
+
+    def clear_cache(self) -> None:
+        """Drop cached biases. Mainly useful in tests and to release device memory."""
+        self._bias_cache.clear()
 
 
 # ---------------------------------------------------------------------------

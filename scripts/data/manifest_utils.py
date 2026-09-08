@@ -15,6 +15,39 @@
 import json
 
 
+def read_manifest(manifest_path):
+    """
+    Read a JSONL manifest file into a list of dicts.
+
+    Drop-in replacement for ``nemo.collections.asr.parts.utils.manifest_utils.read_manifest``
+    so that the prediction and evaluation paths do not require the full NeMo toolkit
+    for what is a six-line JSONL reader.
+
+    Args:
+        manifest_path (str or Path): Path to the manifest file.
+
+    Returns:
+        list: One dict per non-empty line.
+
+    Raises:
+        FileNotFoundError: if the manifest does not exist.
+        json.JSONDecodeError: if a line is not valid JSON, with the line number attached.
+    """
+    data = []
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise json.JSONDecodeError(
+                    f"{e.msg} (in {manifest_path} at line {lineno})", e.doc, e.pos
+                ) from None
+    return data
+
+
 def write_manifest(output_path, target_manifest, ensure_ascii: bool = True):
     """
     Write to manifest file

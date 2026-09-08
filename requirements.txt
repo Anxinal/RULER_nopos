@@ -1,0 +1,30 @@
+# Dependencies for the MaskedTransformer positional-encoding vs attention-mask
+# experiment (scripts/run_experiments.sh).
+#
+# This is deliberately NOT docker/requirements.txt, which pins the full upstream RULER
+# stack (nemo-toolkit, vllm, transformer-engine) for benchmarking third-party LLMs.
+# The custom pipeline needs none of that: the only thing it used NeMo for was a JSONL
+# reader, which now lives in scripts/data/manifest_utils.py.
+#
+#   conda create -n ruler python=3.10 && conda activate ruler
+#   pip install -r requirements.txt
+#
+# Install torch separately if you need a specific CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Model and training
+torch>=2.1            # scaled_dot_product_attention
+transformers>=4.40    # AutoTokenizer
+datasets>=2.14        # only for train.py --data_format text
+
+# Data generation
+nltk>=3.8
+wonderwords>=2.2
+html2text>=2020.1.16  # download_paulgraham_essay.py
+beautifulsoup4>=4.12  # download_paulgraham_essay.py
+tenacity>=8.2
+
+# Evaluation and plumbing
+pandas>=2.0
+pyyaml>=6.0
+tqdm>=4.65

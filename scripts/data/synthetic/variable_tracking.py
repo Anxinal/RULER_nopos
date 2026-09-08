@@ -227,8 +227,12 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_noises = int((max_seq_length / tokens_per_haystack) * 3)
 
-    # Binary search for optimal haystack size
-    lower_bound = incremental
+    # Binary search for optimal haystack size.
+    # NOTE: the lower bound must be 1, not `incremental`. If it is `incremental` and even
+    # that smallest size overflows the budget (which happens at short --max_seq_length),
+    # the search returns nothing, `num_noises` falls back to `incremental`, and the
+    # size-reduction loop below can never decrement -- an unrecoverable silent hang.
+    lower_bound = 1
     upper_bound = max(estimated_max_noises, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_noises = None
@@ -250,7 +254,13 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
             # Too large, need to go smaller
             upper_bound = mid - 1
 
-    num_noises = optimal_num_noises if optimal_num_noises is not None else incremental
+    if optimal_num_noises is None:
+        raise RuntimeError(
+            f"variable_tracking/{args.save_name}: cannot fit even a single noise unit "
+            f"within max_seq_length={max_seq_length} with num_chains={num_chains}, "
+            f"num_hops={num_hops}. Raise --max_seq_length."
+        )
+    num_noises = optimal_num_noises
     logger.info(f'Final optimal haystack size (number of haystack): {num_noises}')
 
     # Generate samples
@@ -269,8 +279,13 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                if used_noises > incremental:
-                    used_noises -= incremental
+                # Decrement toward a floor of 1 and fail loudly rather than spinning forever.
+                if used_noises <= 1:
+                    raise RuntimeError(
+                        f"variable_tracking/{args.save_name}: sample {index} does not fit "
+                        f"within max_seq_length={max_seq_length} even with a single noise unit."
+                    )
+                used_noises = max(1, used_noises - incremental)
 
         if final_output:
             answer_prefix_index = input_text.rfind(TASKS['variable_tracking']['answer_prefix'][:10]) # use first 10 char of answer prefix to locate it

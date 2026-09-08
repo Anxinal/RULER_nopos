@@ -230,8 +230,12 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_questions = int((max_seq_length / tokens_per_haystack) * 3)
 
-    # Binary search for optimal haystack size
-    lower_bound = incremental
+    # Binary search for optimal haystack size.
+    # NOTE: the lower bound must be 1, not `incremental`. If it is `incremental` and even
+    # that smallest size overflows the budget (which happens at short --max_seq_length),
+    # the search returns nothing, `num_haystack` falls back to `incremental`, and the
+    # size-reduction loop below can never decrement -- an unrecoverable silent hang.
+    lower_bound = 1
     upper_bound = max(estimated_max_questions, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_haystack = None
@@ -254,7 +258,13 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
             # Too large, need to go smaller
             upper_bound = mid - 1
 
-    num_haystack = optimal_num_haystack if optimal_num_haystack is not None else incremental
+    if optimal_num_haystack is None:
+        raise RuntimeError(
+            f"niah/{args.save_name}: cannot fit even a single haystack unit within "
+            f"max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}). "
+            f"Raise --max_seq_length."
+        )
+    num_haystack = optimal_num_haystack
     logger.info(f'Final optimal haystack size (number of haystack): {num_haystack}')
 
 
@@ -269,8 +279,14 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                if used_haystack > incremental:
-                    used_haystack -= incremental
+                # Decrement toward a floor of 1 and fail loudly rather than spinning
+                # forever once the smallest possible sample still does not fit.
+                if used_haystack <= 1:
+                    raise RuntimeError(
+                        f"niah/{args.save_name}: sample {index} does not fit within "
+                        f"max_seq_length={max_seq_length} even with a single haystack unit."
+                    )
+                used_haystack = max(1, used_haystack - incremental)
 
         if args.remove_newline_tab:
             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())
@@ -278,8 +294,10 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
         answer_prefix = input_text[answer_prefix_index:]
         input_text = input_text[:answer_prefix_index]
         # find answer position in text
-        index = input_text.find(answer[0])
-        token_position_answer = len(TOKENIZER.text_to_tokens(input_text[:index]))
+        # NOTE: keep this out of `index`, which is the sample id used to deduplicate on
+        # prediction resume. Overwriting it with a character offset collides samples.
+        answer_char_offset = input_text.find(answer[0])
+        token_position_answer = len(TOKENIZER.text_to_tokens(input_text[:answer_char_offset]))
         formatted_output = {
             'index': index,
             "input": input_text,

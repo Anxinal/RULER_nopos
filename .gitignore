@@ -3,3 +3,6 @@ __pycache__/
 *.jsonl
 .vscode/
 *.out
+
+# Experiment outputs: checkpoints, generated data, SLURM logs
+experiments/

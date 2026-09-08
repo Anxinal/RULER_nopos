@@ -42,7 +42,14 @@ import time
 from tqdm import tqdm
 from pathlib import Path
 import traceback
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
+
+# Make the sibling `data` package importable so we can use the in-repo JSONL
+# reader instead of pulling in the whole NeMo toolkit for six lines of code.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.manifest_utils import read_manifest  # noqa: E402
+
+# Upper bound on retries of a single prediction batch before failing the run.
+MAX_RETRIES = 5
 
 SERVER_TYPES = (
     'trtllm',
@@ -92,7 +99,9 @@ parser.add_argument("--batch_size", type=int, default=1)
 
 args = parser.parse_args()
 args.stop_words = list(filter(None, args.stop_words.split(',')))
-if args.server_type == 'hf' or args.server_type == 'gemini':
+# Local in-process models are a single shared torch module with no internal locking,
+# so they must be driven from one thread. Remote clients can be called concurrently.
+if args.server_type in ('hf', 'gemini', 'tmodel'):
     args.threads = 1
 
 
@@ -255,12 +264,21 @@ def main():
     def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list):
         nonlocal llm
 
-        while True:
+        # Retry transient failures (network clients), but give up on a deterministic one
+        # such as an out-of-memory error, which would otherwise spin here forever with
+        # nothing but repeated tracebacks.
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 pred_list = llm.process_batch(prompts=input_list)
                 break
-            except Exception as e:
+            except Exception:
                 traceback.print_exc()
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(
+                        f'process_batch failed {MAX_RETRIES} times in a row; giving up. '
+                        f'See the tracebacks above for the underlying error.'
+                    )
+                time.sleep(min(2 ** attempt, 30))
 
         zipped_iter = zip(pred_list, idx_list, index_list, input_list,
                           outputs_list, others_list, truncation_list, length_list)
@@ -279,7 +297,9 @@ def main():
                 'input': input,
                 'outputs': outputs,
                 'others': others,
-                'truncation': truncation,
+                # Prefer the count the model actually measured over the placeholder
+                # carried in from the generated data, which is always -1.
+                'truncation': pred.get('truncation', truncation),
                 'length': length,
             }
 

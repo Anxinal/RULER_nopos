@@ -7,12 +7,21 @@ Quick start::
     model = MaskedTransformer(
         vocab_size=32000,
         pe_type="rope",             # none | sinusoidal | learned | rope | alibi
-        encoder_mask_type="B",      # B | C | F
-        decoder_mask_type="C",      # B | C | F
+        encoder_mask_spec="CCCCFFFF",  # one code per head: B | C | F
+                                       # (the decoder is always causal)
     )
 """
 
-from .masks import Mask, CausalMask, FutureOnlyMask, BidirectionalMask
+from .masks import (
+    Mask,
+    CausalMask,
+    FutureOnlyMask,
+    BidirectionalMask,
+    build_additive_mask,
+    build_head_mask_bias,
+    parse_mask_spec,
+    clear_mask_cache,
+)
 from .PositionalEmbeddings import (
     PositionalEmbedding,
     NoPositionalEmbedding,
