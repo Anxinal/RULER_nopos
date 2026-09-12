@@ -62,18 +62,47 @@ TGT_LEN=128                # max decoder tokens during training
 SEED=42
 
 # ====================== EXPERIMENT GRID ======================================
-PE_TYPES=("none" "sinusoidal" "learned" "rope" "alibi")
 # Per-head encoder mask specs: one code per attention head (B/C/F), so each entry
 # must be exactly NUM_HEADS characters long. Head order carries no meaning -- heads
 # are concatenated and mixed by one output projection, so only the count of each
 # code matters. The decoder is always causal and is not an axis of this grid.
 MASK_CONFIGS=("BBBBBBBB" "CCCCCCCC" "CCCCFFFF")
 
+# The all-bidirectional spec is the "no mask" condition: every head attends
+# everywhere, so position can only come from the encoding.
+NO_MASK_SPEC="BBBBBBBB"
+
+# This is NOT a full cross, deliberately. A cell with both a mask and a positional
+# encoding confounds the two sources of position, and the question is which one
+# supplies it. So:
+#
+#   * "none" is crossed with every mask -- the mask is then the only thing that can
+#     carry position, which is the arm the whole experiment exists to measure.
+#   * "sinusoidal" is crossed with every mask as the vanilla-transformer reference.
+#   * every other encoding runs only at NO_MASK_SPEC, isolating the encoding.
+PE_CROSSED_WITH_MASKS=("none" "sinusoidal")
+PE_NO_MASK_ONLY=("learned" "rope" "alibi")
+
 for spec in "${MASK_CONFIGS[@]}"; do
     if [ ${#spec} -ne "${NUM_HEADS}" ]; then
         echo "ERROR: mask spec '${spec}' has ${#spec} codes but NUM_HEADS=${NUM_HEADS}." >&2
         exit 1
     fi
+done
+if [ "${NO_MASK_SPEC}" != "$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))" ]; then
+    echo "ERROR: NO_MASK_SPEC='${NO_MASK_SPEC}' is not all-bidirectional for NUM_HEADS=${NUM_HEADS}." >&2
+    exit 1
+fi
+
+# Flatten the grid into explicit "<pe> <mask_spec>" cells.
+EXPERIMENTS=()
+for pe in "${PE_CROSSED_WITH_MASKS[@]}"; do
+    for spec in "${MASK_CONFIGS[@]}"; do
+        EXPERIMENTS+=("${pe} ${spec}")
+    done
+done
+for pe in "${PE_NO_MASK_ONLY[@]}"; do
+    EXPERIMENTS+=("${pe} ${NO_MASK_SPEC}")
 done
 
 # Task list (must match entries in synthetic.yaml)
@@ -325,39 +354,39 @@ fi
 # ====================== DISPATCH LOOP ========================================
 n_jobs=0
 
-for pe in "${PE_TYPES[@]}"; do
-    for enc_mask in "${MASK_CONFIGS[@]}"; do
-        EXP_NAME="pe_${pe}_enc${enc_mask}"
+for cell in "${EXPERIMENTS[@]}"; do
+    read -r pe enc_mask <<< "${cell}"
+    EXP_NAME="pe_${pe}_enc${enc_mask}"
 
-        if $LOCAL; then
-            # ---------- local: prepare shared data once, then run each experiment ---
-            if [ $n_jobs -eq 0 ]; then
-                fetch_corpora
-                generate_train_data
-                generate_eval_data
-            fi
-            run_experiment "${pe}" "${enc_mask}"
-            n_jobs=$((n_jobs + 1))
-            continue
+    if $LOCAL; then
+        # ---------- local: prepare shared data once, then run each experiment ---
+        if [ $n_jobs -eq 0 ]; then
+            fetch_corpora
+            generate_train_data
+            generate_eval_data
         fi
+        run_experiment "${pe}" "${enc_mask}"
+        n_jobs=$((n_jobs + 1))
+        continue
+    fi
 
-        if $DRY_RUN; then
-            echo "[dry-run] would submit: ${EXP_NAME}"
-            n_jobs=$((n_jobs + 1))
-            continue
-        fi
+    if $DRY_RUN; then
+        echo "[dry-run] would submit: ${EXP_NAME}"
+        n_jobs=$((n_jobs + 1))
+        continue
+    fi
 
-        # ---------- SLURM submission -----------------------------------------
-        sbatch \
-            --job-name="${EXP_NAME}" \
-            --partition="${PARTITION}" \
-            --gres="gpu:${GPUS}" \
-            --cpus-per-task="${CPUS}" \
-            --mem="${MEM}" \
-            --time="${TIME}" \
-            --dependency="afterok:${PREP_JOB_ID}" \
-            --output="${LOG_DIR}/${EXP_NAME}_%j.out" \
-            --error="${LOG_DIR}/${EXP_NAME}_%j.err" \
+    # ---------- SLURM submission -----------------------------------------
+    sbatch \
+        --job-name="${EXP_NAME}" \
+        --partition="${PARTITION}" \
+        --gres="gpu:${GPUS}" \
+        --cpus-per-task="${CPUS}" \
+        --mem="${MEM}" \
+        --time="${TIME}" \
+        --dependency="afterok:${PREP_JOB_ID}" \
+        --output="${LOG_DIR}/${EXP_NAME}_%j.out" \
+        --error="${LOG_DIR}/${EXP_NAME}_%j.err" \
             <<SLURM_EOF
 #!/bin/bash
 set -euo pipefail
@@ -379,9 +408,8 @@ $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEA
 run_experiment "${pe}" "${enc_mask}"
 SLURM_EOF
 
-        echo "  -> submitted ${EXP_NAME}"
-        n_jobs=$((n_jobs + 1))
-    done
+    echo "  -> submitted ${EXP_NAME}"
+    n_jobs=$((n_jobs + 1))
 done
 
 echo ""
