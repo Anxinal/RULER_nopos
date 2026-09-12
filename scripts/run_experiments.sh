@@ -36,6 +36,11 @@ AUTO_INSTALL="${AUTO_INSTALL:-true}"
 #   PIP_ARGS='--index-url https://<internal-mirror>/simple'
 #   PIP_ARGS='--no-index --find-links $HOME/wheels'
 PIP_ARGS="${PIP_ARGS:-}"
+# torch is never installed from a bare `pip install torch`, because a plain PyPI wheel
+# may be CPU-only or built against the wrong CUDA and the failure is silent. Name the
+# exact wheel for this cluster and the job will install it, e.g.
+#   TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121'
+TORCH_SPEC="${TORCH_SPEC:-}"
 
 # ====================== MODEL ================================================
 D_MODEL=1024
@@ -180,6 +185,28 @@ mkdir -p "${LOG_DIR}"
 # NOTE: this deliberately runs `python`, not `python3`, because data/prepare.py
 # shells out to a bare `python` -- so if that name is not on PATH, this is where it
 # surfaces rather than thirteen lines deep in a captured subprocess stderr.
+# Activate the project environment. Used by the Slurm jobs and by --local alike:
+# without it, --local silently runs against whatever `python` the login shell has,
+# which is usually the unwritable system interpreter.
+activate_env() {
+    if ! command -v conda &>/dev/null; then
+        echo "WARNING: conda not found; running in the ambient environment." >&2
+        echo "         If this site uses modules or a venv, activate it before running," >&2
+        echo "         or set CONDA_ENV to the environment you want." >&2
+        return 0
+    fi
+    eval "$(conda shell.bash hook)"
+    if ! conda activate "${CONDA_ENV}"; then
+        echo "ERROR: 'conda activate ${CONDA_ENV}' failed." >&2
+        echo "       Create it, or point CONDA_ENV at an existing environment:" >&2
+        echo "           CONDA_ENV=<name> bash run_experiments.sh ..." >&2
+        echo "       Available environments:" >&2
+        conda env list >&2 || true
+        exit 1
+    fi
+    echo "--- Activated conda env: ${CONDA_ENV} ---"
+}
+
 # Reports missing packages as a space-separated list of pip names on stdout.
 _missing_packages() {
     python - <<'PYCHECK'
@@ -240,10 +267,24 @@ check_environment() {
     # back to CPU and the sweep takes weeks instead of hours.
     case " ${missing} " in
         *" torch "*)
-            echo "ERROR: torch is missing, and this script will not install it for you." >&2
-            echo "       Install the wheel matching this cluster's CUDA, e.g." >&2
-            echo "           pip install torch --index-url https://download.pytorch.org/whl/cu121" >&2
-            exit 1
+            if [ -z "${TORCH_SPEC}" ]; then
+                echo "ERROR: torch is missing, and it is never installed from a bare" >&2
+                echo "       'pip install torch'. A plain PyPI wheel may be CPU-only or built" >&2
+                echo "       against the wrong CUDA, and that fails silently: training falls" >&2
+                echo "       back to CPU and the sweep takes weeks instead of hours." >&2
+                echo "       Name the wheel this cluster needs and the job will install it:" >&2
+                echo "           TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121' bash run_experiments.sh" >&2
+                exit 1
+            fi
+            echo "--- Installing torch from TORCH_SPEC: ${TORCH_SPEC} ---"
+            # shellcheck disable=SC2086
+            _pip_install ${TORCH_SPEC}
+            missing="$(_missing_packages)"
+            if [ -z "${missing}" ]; then
+                echo "    environment ready"
+                return 0
+            fi
+            echo "    still missing: ${missing}"
             ;;
     esac
 
@@ -436,21 +477,19 @@ if ! $LOCAL && ! $DRY_RUN; then
         <<PREP_EOF
 #!/bin/bash
 set -euo pipefail
-if command -v conda &>/dev/null; then
-    eval "\$(conda shell.bash hook)"
-    conda activate ${CONDA_ENV}
-else
-    echo "WARNING: conda not found; running in the ambient environment." >&2
-fi
+# Variables first: activate_env reads CONDA_ENV, and under 'set -u' referencing it
+# before it is declared aborts the job immediately.
+$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+             TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
+             EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+$(declare -f activate_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f fetch_corpora)
 $(declare -f generate_train_data)
 $(declare -f generate_eval_data)
-$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
-             TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
-             EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+activate_env
 check_environment
 fetch_corpora
 generate_train_data
@@ -470,6 +509,7 @@ for cell in "${EXPERIMENTS[@]}"; do
     if $LOCAL; then
         # ---------- local: prepare shared data once, then run each experiment ---
         if [ $n_jobs -eq 0 ]; then
+            activate_env
             check_environment
             fetch_corpora
             generate_train_data
@@ -500,33 +540,33 @@ for cell in "${EXPERIMENTS[@]}"; do
             <<SLURM_EOF
 #!/bin/bash
 set -euo pipefail
-if command -v conda &>/dev/null; then
-    eval "\$(conda shell.bash hook)"
-    conda activate ${CONDA_ENV}
-else
-    echo "WARNING: conda not found; running in the ambient environment." >&2
-fi
-
-echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
-
-# Data is produced by the prep job this one depends on; nothing to generate here.
+# Variables first: activate_env reads CONDA_ENV, and under 'set -u' referencing it
+# before it is declared aborts the job immediately.
 # NOTE: no 2>/dev/null on declare -p. Silently dropping an unset variable here would
 # surface much later as an empty path or a skipped flag inside the job.
-$(declare -f _missing_packages)
-$(declare -f _pip_install)
-$(declare -f check_environment)
-$(declare -f run_experiment)
+#
 # Experiment jobs may install too. Normally they never need to: they depend on the
 # prep job via afterok, so it has already installed into the shared environment by
 # the time any of these start, and check_environment finds nothing missing. This
 # matters only when the environment is not shared across nodes, where the prep job's
 # install would not be visible here and hardcoding false would strand every job with
 # no way to recover.
-$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS)
+$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS TORCH_SPEC)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EVAL_SEED TASKS SCRIPT_DIR)
+$(declare -f activate_env)
+$(declare -f _missing_packages)
+$(declare -f _pip_install)
+$(declare -f check_environment)
+$(declare -f run_experiment)
+
+activate_env
+
+echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
+
+# Data is produced by the prep job this one depends on; nothing to generate here.
 check_environment
 run_experiment "${pe}" "${enc_mask}"
 SLURM_EOF
