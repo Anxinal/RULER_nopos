@@ -166,6 +166,40 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
+# ====================== ENVIRONMENT PREFLIGHT ================================
+# Report every missing package at once. Without this a missing dependency fails one
+# job at a time: submit, queue, fail, install one package, resubmit, repeat.
+# NOTE: this deliberately runs `python`, not `python3`, because data/prepare.py
+# shells out to a bare `python` -- so if that name is not on PATH, this is where it
+# surfaces rather than thirteen lines deep in a captured subprocess stderr.
+check_environment() {
+    echo "--- Checking Python environment ---"
+    python - <<'PYCHECK'
+import importlib.util, sys
+
+# module name -> pip name
+REQUIRED = {
+    "torch": "torch", "transformers": "transformers", "numpy": "numpy",
+    "scipy": "scipy", "nltk": "nltk", "wonderwords": "wonderwords",
+    "tenacity": "tenacity", "pandas": "pandas", "yaml": "pyyaml",
+    "tqdm": "tqdm", "requests": "requests",
+}
+missing = sorted({pip for mod, pip in REQUIRED.items()
+                  if importlib.util.find_spec(mod) is None})
+if missing:
+    sys.exit(
+        "Missing Python packages: " + ", ".join(missing) + "\n"
+        "Install all of them at once:\n"
+        "    pip install " + " ".join(missing) + "\n"
+        "or, for the full set:\n"
+        "    pip install -r requirements.txt\n"
+        f"(interpreter: {sys.executable})"
+    )
+print(f"    all {len(REQUIRED)} required packages present")
+print(f"    interpreter: {sys.executable}")
+PYCHECK
+}
+
 # ====================== FETCH SOURCE CORPORA =================================
 # The needle tasks read Paul Graham essays and the QA tasks read SQuAD/HotpotQA.
 # None of the three ships with the repository, and without them data generation
@@ -181,6 +215,17 @@ fetch_corpora() {
     if ! $need_essay && ! $need_qa; then
         echo "    all corpora present, skipping download"
         return 0
+    fi
+
+    # These two are needed only by the essay downloader, so they are checked here
+    # rather than in check_environment: a machine that already has the corpora
+    # should not be forced to install them.
+    if $need_essay; then
+        python -c "import html2text, bs4" 2>/dev/null || {
+            echo "ERROR: downloading the Paul Graham essays needs html2text and beautifulsoup4." >&2
+            echo "       pip install html2text beautifulsoup4" >&2
+            exit 1
+        }
     fi
 
     ( cd "${CORPUS_DIR}" || exit 1
@@ -336,13 +381,17 @@ set -euo pipefail
 if command -v conda &>/dev/null; then
     eval "\$(conda shell.bash hook)"
     conda activate ${CONDA_ENV}
+else
+    echo "WARNING: conda not found; running in the ambient environment." >&2
 fi
+$(declare -f check_environment)
 $(declare -f fetch_corpora)
 $(declare -f generate_train_data)
 $(declare -f generate_eval_data)
 $(declare -p SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+check_environment
 fetch_corpora
 generate_train_data
 generate_eval_data
@@ -361,6 +410,7 @@ for cell in "${EXPERIMENTS[@]}"; do
     if $LOCAL; then
         # ---------- local: prepare shared data once, then run each experiment ---
         if [ $n_jobs -eq 0 ]; then
+            check_environment
             fetch_corpora
             generate_train_data
             generate_eval_data
@@ -393,6 +443,8 @@ set -euo pipefail
 if command -v conda &>/dev/null; then
     eval "\$(conda shell.bash hook)"
     conda activate ${CONDA_ENV}
+else
+    echo "WARNING: conda not found; running in the ambient environment." >&2
 fi
 
 echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
@@ -400,11 +452,13 @@ echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,nohea
 # Data is produced by the prep job this one depends on; nothing to generate here.
 # NOTE: no 2>/dev/null on declare -p. Silently dropping an unset variable here would
 # surface much later as an empty path or a skipped flag inside the job.
+$(declare -f check_environment)
 $(declare -f run_experiment)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EVAL_SEED TASKS SCRIPT_DIR)
+check_environment
 run_experiment "${pe}" "${enc_mask}"
 SLURM_EOF
 

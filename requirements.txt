@@ -16,15 +16,18 @@
 torch>=2.1            # scaled_dot_product_attention
 transformers>=4.40    # AutoTokenizer
 datasets>=2.14        # only for train.py --data_format text
+numpy>=1.24           # niah, variable_tracking, freq_words_extraction
 
 # Data generation
 nltk>=3.8
 wonderwords>=2.2
+scipy>=1.10           # freq_words_extraction: zeta
 html2text>=2020.1.16  # download_paulgraham_essay.py
 beautifulsoup4>=4.12  # download_paulgraham_essay.py
 tenacity>=8.2
 
 # Evaluation and plumbing
 pandas>=2.0
+requests>=2.31        # pred/model_wrappers.py imports it at module level
 pyyaml>=6.0
 tqdm>=4.65
