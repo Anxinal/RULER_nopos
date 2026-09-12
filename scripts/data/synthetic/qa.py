@@ -156,22 +156,50 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     tokens_to_generate = args.tokens_to_generate
     max_seq_length -= args.model_template_token
 
+    # A question's own documents are the smallest haystack that can be built for it;
+    # see the note above the generation loop. Probing below that raises ValueError from
+    # random.sample rather than producing a shorter sample.
+    #
+    # The probe must be a question that actually fits. Using QAS[0] unconditionally lets
+    # one unlucky first question abort a task that every other question could have
+    # satisfied, since document lengths vary a lot between questions.
+    PROBE_WINDOW = 200
+    probe_index = None
+    for candidate in range(args.pre_samples, min(len(QAS), args.pre_samples + PROBE_WINDOW)):
+        floor = max(1, len(QAS[candidate]['context']))
+        text, _ = generate_input_output(candidate, floor)
+        if len(TOKENIZER.text_to_tokens(text)) + tokens_to_generate <= max_seq_length:
+            probe_index, probe_floor = candidate, floor
+            break
+
+    if probe_index is None:
+        raise RuntimeError(
+            f"qa/{args.save_name}: none of the first {PROBE_WINDOW} questions fit within "
+            f"max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}) "
+            f"even reduced to their own documents, which cannot be split. "
+            f"Raise --max_seq_length."
+        )
+    if probe_index != args.pre_samples:
+        logger.info(f'Using question {probe_index} to size the haystack (earlier ones do not fit)')
+
     # Estimate tokens per question to determine reasonable upper bound
-    sample_input_text, _ = generate_input_output(0, incremental)
+    probe_docs = max(incremental, probe_floor)
+    sample_input_text, _ = generate_input_output(probe_index, probe_docs)
     sample_tokens = len(TOKENIZER.text_to_tokens(sample_input_text))
-    tokens_per_doc = sample_tokens / incremental
+    tokens_per_doc = sample_tokens / probe_docs
 
     # Let's do 3x to allow for some slack since we can get unlucky due to sampling.
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_docs = int((max_seq_length / tokens_per_doc) * 3)
 
     # Binary search for optimal haystack size.
-    # NOTE: the lower bound must be 1, not `incremental`. If it is `incremental` and even
-    # that smallest size overflows the budget (which happens at short --max_seq_length,
-    # since a single SQuAD/HotpotQA paragraph is already ~100-200 tokens), the search
-    # returns nothing, `num_docs` falls back to `incremental`, and the size-reduction
-    # loop below can never decrement -- an unrecoverable silent hang.
-    lower_bound = 1
+    # NOTE: the lower bound must not be `incremental`. If it is, and even that smallest
+    # size overflows the budget (which happens at short --max_seq_length, since a single
+    # SQuAD/HotpotQA paragraph is already ~100-200 tokens), the search returns nothing,
+    # `num_docs` falls back to `incremental`, and the size-reduction loop below can never
+    # decrement -- an unrecoverable silent hang. It cannot go below probe_floor either,
+    # so that is the bound.
+    lower_bound = probe_floor
     upper_bound = max(estimated_max_docs, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_docs = None
@@ -181,7 +209,7 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
 
     while lower_bound <= upper_bound:
         mid = (lower_bound + upper_bound) // 2
-        input_text, answer = generate_input_output(0, mid)
+        input_text, answer = generate_input_output(probe_index, mid)
         total_tokens = len(TOKENIZER.text_to_tokens(input_text)) + tokens_to_generate
 
         logger.info(f"Testing haystack size: {mid}, resulting tokens: {total_tokens}/{max_seq_length}")
@@ -196,30 +224,50 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
 
     if optimal_num_docs is None:
         raise RuntimeError(
-            f"qa/{args.save_name}: cannot fit even a single document within "
-            f"max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}). "
-            f"Raise --max_seq_length."
+            f"qa/{args.save_name}: the probe question's own {probe_floor} document(s) "
+            f"already exceed max_seq_length={max_seq_length} "
+            f"(tokens_to_generate={tokens_to_generate}). Raise --max_seq_length."
         )
     num_docs = optimal_num_docs
     logger.info(f'Final optimal haystack size (number of docs): {num_docs}')
 
-    # Generate samples
-    for index in tqdm(range(num_samples)):
-        used_docs = num_docs
-        while(True):
-            try:
-                input_text, answer = generate_input_output(index + args.pre_samples, used_docs)
-                length = len(TOKENIZER.text_to_tokens(input_text)) + tokens_to_generate
-                assert length <= max_seq_length, f"{length} exceeds max_seq_length."
+    # Generate samples.
+    #
+    # A question's own documents are a hard floor on how far the haystack can shrink.
+    # For HotpotQA, `context` holds all ten distractor paragraphs and the loader keeps
+    # no record of which two are the gold ones, so dropping any of them risks removing
+    # the answer and producing an unanswerable sample. Below that floor,
+    # generate_input_output also computes a negative sample count and raises
+    # ValueError: Sample larger than population or is negative.
+    #
+    # A question whose own documents already exceed the budget is therefore skipped
+    # rather than mangled, and the next question is tried instead. Length is compared
+    # explicitly rather than via assert-and-bare-except, so a genuine bug propagates
+    # with its own traceback instead of being relabelled as a length problem.
+    n_skipped = 0
+    qa_index = args.pre_samples
+    n_questions = len(QAS)
+    progress = tqdm(total=num_samples)
+
+    while len(write_jsons) < num_samples and qa_index < n_questions:
+        floor = len(QAS[qa_index]['context'])
+        used_docs = max(num_docs, floor)
+        fits = False
+
+        while True:
+            input_text, answer = generate_input_output(qa_index, used_docs)
+            length = len(TOKENIZER.text_to_tokens(input_text)) + tokens_to_generate
+            if length <= max_seq_length:
+                fits = True
                 break
-            except:
-                # Decrement toward a floor of 1 and fail loudly rather than spinning forever.
-                if used_docs <= 1:
-                    raise RuntimeError(
-                        f"qa/{args.save_name}: sample {index} does not fit within "
-                        f"max_seq_length={max_seq_length} even with a single document."
-                    )
-                used_docs = max(1, used_docs - incremental)
+            if used_docs <= floor:
+                break
+            used_docs = max(floor, used_docs - incremental)
+
+        if not fits:
+            n_skipped += 1
+            qa_index += 1
+            continue
 
         if args.remove_newline_tab:
             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())
@@ -227,7 +275,7 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
         answer_prefix = input_text[answer_prefix_index:]
         input_text = input_text[:answer_prefix_index]
         formatted_output = {
-            "index": index,
+            "index": len(write_jsons),
             "input": input_text,
             "outputs": answer,
             "length": length,
@@ -235,6 +283,23 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
             'answer_prefix': answer_prefix,
         }
         write_jsons.append(formatted_output)
+        progress.update(1)
+        qa_index += 1
+
+    progress.close()
+
+    if n_skipped:
+        logger.warning(
+            f'{n_skipped} question(s) skipped: their own documents exceed '
+            f'max_seq_length={max_seq_length}.'
+        )
+    if len(write_jsons) < num_samples:
+        raise RuntimeError(
+            f"qa/{args.save_name}: only {len(write_jsons)} of {num_samples} samples fit "
+            f"within max_seq_length={max_seq_length} after trying all "
+            f"{n_questions - args.pre_samples} questions ({n_skipped} skipped). "
+            f"Raise --max_seq_length or lower --num_samples."
+        )
 
     return write_jsons
 
