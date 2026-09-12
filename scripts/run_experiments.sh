@@ -31,6 +31,11 @@ CONDA_ENV="${CONDA_ENV:-ruler}"
 # Install missing Python packages from inside the job rather than by hand first.
 # torch is always excluded; see check_environment for why.
 AUTO_INSTALL="${AUTO_INSTALL:-true}"
+# Extra flags for every pip install, for sites where PyPI is not directly reachable
+# from a compute node. Examples:
+#   PIP_ARGS='--index-url https://<internal-mirror>/simple'
+#   PIP_ARGS='--no-index --find-links $HOME/wheels'
+PIP_ARGS="${PIP_ARGS:-}"
 
 # ====================== MODEL ================================================
 D_MODEL=1024
@@ -202,11 +207,14 @@ _pip_install() {
         exit 1
     fi
     echo "--- Installing: $* ---"
-    if ! python -m pip install --no-input --disable-pip-version-check "$@"; then
+    if ! python -m pip install --no-input --disable-pip-version-check ${PIP_ARGS} "$@"; then
         echo "ERROR: pip install failed." >&2
-        echo "       Compute nodes often have no outbound network. If that is the case" >&2
-        echo "       here, install on the login node instead and resubmit:" >&2
-        echo "           conda activate ${CONDA_ENV} && pip install -r requirements.txt" >&2
+        echo "       The usual cause is that this compute node has no outbound network." >&2
+        echo "       Check with:" >&2
+        echo "           srun --partition=${PARTITION} --time=00:02:00 python -m pip download --dest /tmp tqdm" >&2
+        echo "       If that is the problem, point PIP_ARGS at a reachable source, e.g." >&2
+        echo "           PIP_ARGS='--index-url https://<internal-mirror>/simple' bash run_experiments.sh" >&2
+        echo "           PIP_ARGS='--no-index --find-links \$HOME/wheels' bash run_experiments.sh" >&2
         exit 1
     fi
 }
@@ -440,7 +448,7 @@ $(declare -f check_environment)
 $(declare -f fetch_corpora)
 $(declare -f generate_train_data)
 $(declare -f generate_eval_data)
-$(declare -p AUTO_INSTALL CONDA_ENV SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
 check_environment
@@ -508,8 +516,13 @@ $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f run_experiment)
-AUTO_INSTALL=false   # the prep job already installed; never install from 9 jobs at once
-CONDA_ENV=${CONDA_ENV}
+# Experiment jobs may install too. Normally they never need to: they depend on the
+# prep job via afterok, so it has already installed into the shared environment by
+# the time any of these start, and check_environment finds nothing missing. This
+# matters only when the environment is not shared across nodes, where the prep job's
+# install would not be visible here and hardcoding false would strand every job with
+# no way to recover.
+$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
