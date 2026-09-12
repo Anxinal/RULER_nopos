@@ -409,11 +409,17 @@ def main(args):
         log.info("Epoch %d/%d | train %.4f (ppl %.1f) | val %.4f (ppl %.1f) | %.0fs",
                  epoch, args.epochs, train_loss, train_ppl, val_loss, val_ppl, elapsed)
 
-        # checkpoint
-        ckpt = dict(epoch=epoch, model=model.state_dict(),
-                    optimizer=optimizer.state_dict(), val_loss=val_loss,
+        # Checkpoint. Weights only by default: the optimizer state is roughly twice
+        # the size of the weights again, and nothing reads it back -- there is no
+        # resume path, and prediction needs only the weights plus the token config.
+        ckpt = dict(epoch=epoch, model=model.state_dict(), val_loss=val_loss,
                     args=vars(args), **token_config)
-        torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
+        if args.save_optimizer:
+            ckpt["optimizer"] = optimizer.state_dict()
+
+        # last.pt is not read by anything downstream; prediction loads best.pt.
+        if args.save_last:
+            torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
         if val_loss < best_val:
             best_val = val_loss
             torch.save(ckpt, os.path.join(args.output_dir, "best.pt"))
@@ -485,6 +491,13 @@ def parse_args():
 
     # Output
     p.add_argument("--output_dir", required=True)
+    p.add_argument("--save_optimizer", action="store_true",
+                   help="Include AdamW state in the checkpoint. Roughly triples its "
+                        "size and is only useful for resuming training, which this "
+                        "pipeline does not do.")
+    p.add_argument("--save_last", action="store_true",
+                   help="Also write last.pt each epoch. Nothing downstream reads it; "
+                        "prediction loads best.pt.")
 
     return p.parse_args()
 
