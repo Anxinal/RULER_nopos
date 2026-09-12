@@ -27,7 +27,13 @@ GPUS="${GPUS:-1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
 TIME="${TIME:-48:00:00}"
-CONDA_ENV="${CONDA_ENV:-ruler}"
+# Python environment. The virtualenv is created on first use and populated from
+# REQUIREMENTS. It must live somewhere every compute node can see, which the repo
+# root normally is; override VENV_DIR if your home is not shared.
+VENV_DIR="${VENV_DIR:-${SCRIPT_DIR}/../.venv}"
+REQUIREMENTS="${REQUIREMENTS:-${SCRIPT_DIR}/../requirements.txt}"
+# Interpreter used to build the venv, not the one inside it.
+BOOTSTRAP_PYTHON="${BOOTSTRAP_PYTHON:-python3}"
 # Install missing Python packages from inside the job rather than by hand first.
 # torch is always excluded; see check_environment for why.
 AUTO_INSTALL="${AUTO_INSTALL:-true}"
@@ -185,26 +191,58 @@ mkdir -p "${LOG_DIR}"
 # NOTE: this deliberately runs `python`, not `python3`, because data/prepare.py
 # shells out to a bare `python` -- so if that name is not on PATH, this is where it
 # surfaces rather than thirteen lines deep in a captured subprocess stderr.
-# Activate the project environment. Used by the Slurm jobs and by --local alike:
-# without it, --local silently runs against whatever `python` the login shell has,
-# which is usually the unwritable system interpreter.
-activate_env() {
-    if ! command -v conda &>/dev/null; then
-        echo "WARNING: conda not found; running in the ambient environment." >&2
-        echo "         If this site uses modules or a venv, activate it before running," >&2
-        echo "         or set CONDA_ENV to the environment you want." >&2
+# Create the virtualenv if it is not there, activate it, and populate it from
+# requirements.txt. Used by the Slurm jobs and by --local alike: without it, --local
+# silently runs against whatever `python` the login shell has, which is usually the
+# unwritable system interpreter.
+#
+# Activation is done by hand rather than by sourcing bin/activate, because that script
+# touches unset variables and this runs under 'set -u'. Putting the venv's bin first on
+# PATH also makes a bare `python` resolve to it, which data/prepare.py depends on when
+# it shells out to the generators.
+setup_env() {
+    if [ ! -x "${VENV_DIR}/bin/python" ]; then
+        echo "--- Creating virtualenv: ${VENV_DIR} ---"
+        if ! "${BOOTSTRAP_PYTHON}" -m venv "${VENV_DIR}"; then
+            echo "ERROR: could not create a virtualenv with '${BOOTSTRAP_PYTHON} -m venv'." >&2
+            echo "       Point BOOTSTRAP_PYTHON at a usable interpreter, or load a python" >&2
+            echo "       module first. Some sites need the python3-venv package." >&2
+            exit 1
+        fi
+    fi
+
+    export VIRTUAL_ENV="${VENV_DIR}"
+    export PATH="${VENV_DIR}/bin:${PATH}"
+    unset PYTHONHOME 2>/dev/null || true
+    echo "--- Using virtualenv: ${VENV_DIR} ---"
+
+    # Reinstall when requirements.txt is newer than the last successful install, so
+    # editing it is enough to refresh the environment. The marker is written only on
+    # success, so an interrupted install is retried rather than assumed complete.
+    local marker="${VENV_DIR}/.requirements-installed"
+    if [ -f "${marker}" ] && [ ! "${REQUIREMENTS}" -nt "${marker}" ]; then
         return 0
     fi
-    eval "$(conda shell.bash hook)"
-    if ! conda activate "${CONDA_ENV}"; then
-        echo "ERROR: 'conda activate ${CONDA_ENV}' failed." >&2
-        echo "       Create it, or point CONDA_ENV at an existing environment:" >&2
-        echo "           CONDA_ENV=<name> bash run_experiments.sh ..." >&2
-        echo "       Available environments:" >&2
-        conda env list >&2 || true
+
+    if [ ! -f "${REQUIREMENTS}" ]; then
+        echo "ERROR: requirements file not found: ${REQUIREMENTS}" >&2
         exit 1
     fi
-    echo "--- Activated conda env: ${CONDA_ENV} ---"
+
+    # A CUDA-specific torch must go in first: installing it before requirements.txt
+    # means the later 'torch>=2.1' line is already satisfied and will not pull a
+    # different wheel over the top of it.
+    if [ -n "${TORCH_SPEC}" ] && ! python -c "import torch" 2>/dev/null; then
+        echo "--- Installing torch from TORCH_SPEC: ${TORCH_SPEC} ---"
+        # shellcheck disable=SC2086
+        _pip_install ${TORCH_SPEC}
+    fi
+
+    echo "--- Installing from ${REQUIREMENTS} ---"
+    python -m pip install --quiet --upgrade pip || true
+    _pip_install -r "${REQUIREMENTS}"
+    touch "${marker}"
+    echo "    environment ready"
 }
 
 # Reports missing packages as a space-separated list of pip names on stdout.
@@ -477,19 +515,19 @@ if ! $LOCAL && ! $DRY_RUN; then
         <<PREP_EOF
 #!/bin/bash
 set -euo pipefail
-# Variables first: activate_env reads CONDA_ENV, and under 'set -u' referencing it
-# before it is declared aborts the job immediately.
-$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+# Variables first: setup_env reads VENV_DIR and friends, and under 'set -u'
+# referencing them before they are declared aborts the job immediately.
+$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
-$(declare -f activate_env)
+$(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f fetch_corpora)
 $(declare -f generate_train_data)
 $(declare -f generate_eval_data)
-activate_env
+setup_env
 check_environment
 fetch_corpora
 generate_train_data
@@ -509,7 +547,7 @@ for cell in "${EXPERIMENTS[@]}"; do
     if $LOCAL; then
         # ---------- local: prepare shared data once, then run each experiment ---
         if [ $n_jobs -eq 0 ]; then
-            activate_env
+            setup_env
             check_environment
             fetch_corpora
             generate_train_data
@@ -540,8 +578,8 @@ for cell in "${EXPERIMENTS[@]}"; do
             <<SLURM_EOF
 #!/bin/bash
 set -euo pipefail
-# Variables first: activate_env reads CONDA_ENV, and under 'set -u' referencing it
-# before it is declared aborts the job immediately.
+# Variables first: setup_env reads VENV_DIR and friends, and under 'set -u'
+# referencing them before they are declared aborts the job immediately.
 # NOTE: no 2>/dev/null on declare -p. Silently dropping an unset variable here would
 # surface much later as an empty path or a skipped flag inside the job.
 #
@@ -551,18 +589,18 @@ set -euo pipefail
 # matters only when the environment is not shared across nodes, where the prep job's
 # install would not be visible here and hardcoding false would strand every job with
 # no way to recover.
-$(declare -p AUTO_INSTALL CONDA_ENV PIP_ARGS TORCH_SPEC)
+$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EVAL_SEED TASKS SCRIPT_DIR)
-$(declare -f activate_env)
+$(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f run_experiment)
 
-activate_env
+setup_env
 
 echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
 
