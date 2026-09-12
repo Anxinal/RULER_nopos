@@ -28,6 +28,9 @@ CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
 TIME="${TIME:-48:00:00}"
 CONDA_ENV="${CONDA_ENV:-ruler}"
+# Install missing Python packages from inside the job rather than by hand first.
+# torch is always excluded; see check_environment for why.
+AUTO_INSTALL="${AUTO_INSTALL:-true}"
 
 # ====================== MODEL ================================================
 D_MODEL=1024
@@ -166,6 +169,87 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
+# ====================== ENVIRONMENT PREFLIGHT ================================
+# Report every missing package at once. Without this a missing dependency fails one
+# job at a time: submit, queue, fail, install one package, resubmit, repeat.
+# NOTE: this deliberately runs `python`, not `python3`, because data/prepare.py
+# shells out to a bare `python` -- so if that name is not on PATH, this is where it
+# surfaces rather than thirteen lines deep in a captured subprocess stderr.
+# Reports missing packages as a space-separated list of pip names on stdout.
+_missing_packages() {
+    python - <<'PYCHECK'
+import importlib.util
+
+# python module name -> pip distribution name (they differ for some)
+REQUIRED = {
+    "torch": "torch", "transformers": "transformers", "numpy": "numpy",
+    "scipy": "scipy", "nltk": "nltk", "wonderwords": "wonderwords",
+    "tenacity": "tenacity", "pandas": "pandas", "yaml": "pyyaml",
+    "tqdm": "tqdm", "requests": "requests",
+}
+print(" ".join(sorted({pip for mod, pip in REQUIRED.items()
+                       if importlib.util.find_spec(mod) is None})))
+PYCHECK
+}
+
+# Install the named pip packages into the *same* interpreter the checks use, then
+# verify they import. `python -m pip` rather than a bare `pip`, which on a cluster
+# often resolves to a different environment than `python` does.
+_pip_install() {
+    if ! $AUTO_INSTALL; then
+        echo "ERROR: missing packages and AUTO_INSTALL=false." >&2
+        echo "       Install them yourself:  python -m pip install $*" >&2
+        exit 1
+    fi
+    echo "--- Installing: $* ---"
+    if ! python -m pip install --no-input --disable-pip-version-check "$@"; then
+        echo "ERROR: pip install failed." >&2
+        echo "       Compute nodes often have no outbound network. If that is the case" >&2
+        echo "       here, install on the login node instead and resubmit:" >&2
+        echo "           conda activate ${CONDA_ENV} && pip install -r requirements.txt" >&2
+        exit 1
+    fi
+}
+
+check_environment() {
+    echo "--- Checking Python environment ---"
+    if ! python -c "import sys; print('    interpreter:', sys.executable)"; then
+        echo "ERROR: no 'python' on PATH. data/prepare.py shells out to a bare 'python'," >&2
+        echo "       so it must exist, not just 'python3'." >&2
+        exit 1
+    fi
+
+    local missing
+    missing="$(_missing_packages)"
+    if [ -z "${missing}" ]; then
+        echo "    all required packages present"
+        return 0
+    fi
+    echo "    missing: ${missing}"
+
+    # torch is deliberately never auto-installed. A plain PyPI wheel may be CPU-only
+    # or built against the wrong CUDA, and the failure mode is silent: training falls
+    # back to CPU and the sweep takes weeks instead of hours.
+    case " ${missing} " in
+        *" torch "*)
+            echo "ERROR: torch is missing, and this script will not install it for you." >&2
+            echo "       Install the wheel matching this cluster's CUDA, e.g." >&2
+            echo "           pip install torch --index-url https://download.pytorch.org/whl/cu121" >&2
+            exit 1
+            ;;
+    esac
+
+    # shellcheck disable=SC2086
+    _pip_install ${missing}
+
+    missing="$(_missing_packages)"
+    if [ -n "${missing}" ]; then
+        echo "ERROR: still missing after install: ${missing}" >&2
+        exit 1
+    fi
+    echo "    environment ready"
+}
+
 # ====================== FETCH SOURCE CORPORA =================================
 # The needle tasks read Paul Graham essays and the QA tasks read SQuAD/HotpotQA.
 # None of the three ships with the repository, and without them data generation
@@ -181,6 +265,17 @@ fetch_corpora() {
     if ! $need_essay && ! $need_qa; then
         echo "    all corpora present, skipping download"
         return 0
+    fi
+
+    # These two are needed only by the essay downloader, so they are handled here
+    # rather than in check_environment: a machine that already has the corpora
+    # should not be made to install a downloader it will never run.
+    if $need_essay && ! python -c "import html2text, bs4" 2>/dev/null; then
+        _pip_install html2text beautifulsoup4
+        python -c "import html2text, bs4" || {
+            echo "ERROR: html2text/beautifulsoup4 still unavailable after install." >&2
+            exit 1
+        }
     fi
 
     ( cd "${CORPUS_DIR}" || exit 1
@@ -336,13 +431,19 @@ set -euo pipefail
 if command -v conda &>/dev/null; then
     eval "\$(conda shell.bash hook)"
     conda activate ${CONDA_ENV}
+else
+    echo "WARNING: conda not found; running in the ambient environment." >&2
 fi
+$(declare -f _missing_packages)
+$(declare -f _pip_install)
+$(declare -f check_environment)
 $(declare -f fetch_corpora)
 $(declare -f generate_train_data)
 $(declare -f generate_eval_data)
-$(declare -p SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+$(declare -p AUTO_INSTALL CONDA_ENV SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+check_environment
 fetch_corpora
 generate_train_data
 generate_eval_data
@@ -361,6 +462,7 @@ for cell in "${EXPERIMENTS[@]}"; do
     if $LOCAL; then
         # ---------- local: prepare shared data once, then run each experiment ---
         if [ $n_jobs -eq 0 ]; then
+            check_environment
             fetch_corpora
             generate_train_data
             generate_eval_data
@@ -393,6 +495,8 @@ set -euo pipefail
 if command -v conda &>/dev/null; then
     eval "\$(conda shell.bash hook)"
     conda activate ${CONDA_ENV}
+else
+    echo "WARNING: conda not found; running in the ambient environment." >&2
 fi
 
 echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo N/A)"
@@ -400,11 +504,17 @@ echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,nohea
 # Data is produced by the prep job this one depends on; nothing to generate here.
 # NOTE: no 2>/dev/null on declare -p. Silently dropping an unset variable here would
 # surface much later as an empty path or a skipped flag inside the job.
+$(declare -f _missing_packages)
+$(declare -f _pip_install)
+$(declare -f check_environment)
 $(declare -f run_experiment)
+AUTO_INSTALL=false   # the prep job already installed; never install from 9 jobs at once
+CONDA_ENV=${CONDA_ENV}
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EVAL_SEED TASKS SCRIPT_DIR)
+check_environment
 run_experiment "${pe}" "${enc_mask}"
 SLURM_EOF
 
