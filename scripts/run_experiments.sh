@@ -87,9 +87,13 @@ TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
 TRAIN_SAMPLES=2000          # samples per task per seq length
 TRAIN_SEED=0                # separate seed to avoid data leakage
 
-# 2x and 4x the training length. Neither is in-distribution, which is deliberate:
-# the question is extrapolation, and 4096 is the cheapest point that still is.
-EVAL_SEQ_LENGTHS=(4096 8192)
+# 2048 is the training length, then 2x and 4x it.
+#
+# The in-distribution point is NOT optional. Without it a score of 0.0 at 4096 is
+# uninterpretable: "the model learned the task but cannot extrapolate" and "the model
+# never learned the task at all" produce identical numbers. Only the 2048 column tells
+# them apart, and it is the cheapest of the three to run.
+EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=500
 EVAL_SEED=42                # RULER default
 
@@ -170,7 +174,11 @@ done
 
 # ====================== SUMMARY MODE =========================================
 if $SUMMARY; then
-    echo "pe_type,encoder_mask,seq_length,task,score"
+    # `nulls` is carried through because the metric is a plain substring match: an
+    # empty prediction and a confidently wrong one both score 0.0, and only the null
+    # count separates "the model emitted nothing" from "the model emitted the wrong
+    # thing". Those two have completely different causes.
+    echo "pe_type,encoder_mask,seq_length,task,score,nulls"
     for dir in "${EXP_ROOT}"/results/pe_*/synthetic/*/pred; do
         [ -f "${dir}/summary.csv" ] || continue
         # Parse path: .../pe_<PE>_enc<SPEC>/synthetic/<SEQ>/pred/summary.csv
@@ -197,10 +205,12 @@ with open('${dir}/summary.csv') as f:
 by_label = {r[0]: r[1:] for r in rows if r}
 tasks  = by_label.get('Tasks', [])
 scores = by_label.get('Score', [])
+nulls  = by_label.get('Nulls', [])
 if not tasks:
     sys.exit(f'malformed summary: ${dir}/summary.csv')
-for t, s in zip(tasks, scores):
-    print(f'${pe},${enc},${seq},{t},{s}')
+nulls += [''] * (len(tasks) - len(nulls))
+for t, s, n in zip(tasks, scores, nulls):
+    print(f'${pe},${enc},${seq},{t},{s},{n}')
 "
     done
     exit 0

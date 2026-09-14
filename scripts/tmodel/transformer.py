@@ -135,6 +135,20 @@ class MaskedTransformer(nn.Module):
             if p.dim() > 1 and "embed" not in name:
                 nn.init.xavier_uniform_(p)
 
+        # Embeddings are excluded above, so without this they keep nn.Embedding's
+        # default N(0, 1). That is catastrophic here for two compounding reasons:
+        # the output projection is tied to this same tensor, so logits come out with
+        # std ~= sqrt(d_model) = 32, and _embed multiplies by embed_scale = sqrt(d_model)
+        # on the way in as well. Cross-entropy then starts near 1000 instead of
+        # ln(vocab_size) ~= 10.8, and most of the training budget goes on undoing the
+        # initialisation rather than learning the task.
+        #
+        # std = d_model^-0.5 is the convention that pairs with embed_scale: it makes
+        # embed(x) * sqrt(d_model) unit scale, and the tied output layer unit scale too.
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.d_model ** -0.5)
+        with torch.no_grad():
+            self.embed_tokens.weight[self.pad_token_id].zero_()
+
     # ------------------------------------------------------------------
     # Mask helpers
     # ------------------------------------------------------------------

@@ -46,10 +46,15 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_SCRIPT_DIR, ".."))
 from tmodel import MaskedTransformer  # noqa: E402
 
+# stream=sys.stdout explicitly: logging.basicConfig defaults to stderr, which under
+# Slurm sends the whole training log to the .err file while the evaluation steps,
+# which use print(), go to .out. Splitting one run across two files makes it look
+# like no training happened at all.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
@@ -367,6 +372,28 @@ def main(args):
     )
     scheduler = cosine_with_warmup(optimizer, warmup, total_steps)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+
+    # Sanity-check the initialisation before spending hours on it. An untrained model
+    # predicts roughly uniformly over the vocabulary, so its loss must start near
+    # ln(vocab_size). A much larger value means the output logits are badly scaled --
+    # which costs most of the training budget to undo and is invisible in the logs,
+    # because perplexity saturates at exp(20) and then reads as a frozen constant.
+    expected = math.log(vocab_size)
+    src0, tgt0 = next(iter(train_loader))
+    model.eval()
+    with torch.no_grad():
+        logits0 = model(src0.to(device), tgt0[:, :-1].to(device))
+        init_loss = criterion(logits0.reshape(-1, vocab_size),
+                              tgt0[:, 1:].reshape(-1).to(device)).item()
+    model.train()
+    log.info("Initial loss %.2f (expected ~%.2f for a uniform model over %d tokens)",
+             init_loss, expected, vocab_size)
+    if init_loss > 3 * expected:
+        log.warning(
+            "Initial loss is %.0fx the uniform baseline. The model is badly "
+            "initialised; training will mostly undo this rather than learn the task.",
+            init_loss / expected,
+        )
 
     use_amp = args.fp16 and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
