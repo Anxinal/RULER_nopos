@@ -101,7 +101,7 @@ EVAL_SEED=42                # RULER default
 EPOCHS=20
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
-LR=1e-4
+LR=2e-4
 WARMUP=1000
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
