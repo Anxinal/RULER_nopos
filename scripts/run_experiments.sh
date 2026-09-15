@@ -84,7 +84,7 @@ TOKENIZER="gpt2"
 # the task, but if too many are skipped to reach TRAIN_SAMPLES the task still fails.
 # Verify with the probe in the header comment before a full submission.
 TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
-TRAIN_SAMPLES=2000          # samples per task per seq length
+TRAIN_SAMPLES=5000          # samples per task per seq length
 TRAIN_SEED=0                # separate seed to avoid data leakage
 
 # 2048 is the training length, then 2x and 4x it.
@@ -106,6 +106,22 @@ WARMUP=1000
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 SEED=42
+
+# ====================== FLAGS ================================================
+# Parsed before the grid is built, so --sanity can override the configuration above
+# before it is validated.
+DRY_RUN=false
+LOCAL=false
+SUMMARY=false
+SANITY=false
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --local)   LOCAL=true ;;
+        --summary) SUMMARY=true ;;
+        --sanity)  SANITY=true ;;
+    esac
+done
 
 # ====================== EXPERIMENT GRID ======================================
 # Per-head encoder mask specs: one code per attention head (B/C/F), so each entry
@@ -129,6 +145,43 @@ NO_MASK_SPEC="BBBBBBBB"
 PE_CROSSED_WITH_MASKS=("none" "sinusoidal")
 PE_NO_MASK_ONLY=("learned" "rope" "alibi")
 
+# ====================== SANITY MODE ==========================================
+# A positive control. One task, short context, small model, evaluated at the length
+# it trained on, with a score it must beat.
+#
+# This exists because a null result is uninterpretable without one. Three separate
+# defects -- an initialisation that started the loss near 1000, a target tokenisation
+# that made the answer uncopyable, and training on one of ten answers -- all produced
+# the same signal: zeros in every cell. None was distinguishable from "masks cannot
+# substitute for positional encodings", which is the thing the grid is meant to
+# measure. Run this before spending GPU-days on the grid.
+SANITY_MIN_SCORE="${SANITY_MIN_SCORE:-40}"
+
+if $SANITY; then
+    echo "=== SANITY MODE: positive control, not an experiment ==="
+    SANITY_TASKS=("niah_single_1")     # single needle, noise haystack, no corpus needed
+    TRAIN_SEQ_LENGTHS=(512)
+    EVAL_SEQ_LENGTHS=(512)             # in-distribution on purpose
+    TRAIN_SAMPLES="${SANITY_TRAIN_SAMPLES:-4000}"
+    EVAL_SAMPLES="${SANITY_EVAL_SAMPLES:-200}"
+
+    D_MODEL=256; NUM_HEADS=4; NUM_LAYERS=4; D_FF=1024; DROPOUT=0.0
+    MAX_LEN=1024; SRC_LEN=512; TGT_LEN=32
+
+    EPOCHS="${SANITY_EPOCHS:-30}"; BATCH_SIZE=16; GRAD_ACCUM=1
+    LR=3e-4; WARMUP=200
+    KEEP_CHECKPOINTS=true              # keep it, so a failure can be inspected
+
+    # Sinusoidal + causal: the arm most likely to work. If this cannot retrieve a
+    # needle from 512 tokens it saw in training, nothing in the grid is meaningful.
+    SANITY_SPEC="$(printf 'C%.0s' $(seq 1 "${NUM_HEADS}"))"
+    MASK_CONFIGS=("${SANITY_SPEC}")
+    NO_MASK_SPEC="$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))"
+    PE_CROSSED_WITH_MASKS=("sinusoidal")
+    PE_NO_MASK_ONLY=()
+fi
+
+
 for spec in "${MASK_CONFIGS[@]}"; do
     if [ ${#spec} -ne "${NUM_HEADS}" ]; then
         echo "ERROR: mask spec '${spec}' has ${#spec} codes but NUM_HEADS=${NUM_HEADS}." >&2
@@ -147,30 +200,24 @@ for pe in "${PE_CROSSED_WITH_MASKS[@]}"; do
         EXPERIMENTS+=("${pe} ${spec}")
     done
 done
-for pe in "${PE_NO_MASK_ONLY[@]}"; do
+for pe in ${PE_NO_MASK_ONLY[@]+"${PE_NO_MASK_ONLY[@]}"}; do
     EXPERIMENTS+=("${pe} ${NO_MASK_SPEC}")
 done
 
 # Task list (must match entries in synthetic.yaml)
 source "${SCRIPT_DIR}/config_tasks.sh"
-TASKS=("${synthetic[@]}")
+if $SANITY; then
+    # Applied here, not in the sanity block above, because this line would otherwise
+    # overwrite it -- config_tasks.sh is sourced after the grid is configured.
+    TASKS=("${SANITY_TASKS[@]}")
+else
+    TASKS=("${synthetic[@]}")
+fi
 
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
 LOG_DIR="${EXP_ROOT}/slurm_logs"
 TRAIN_SCRIPT="${SCRIPT_DIR}/tmodel/train.py"
-
-# ====================== FLAGS ================================================
-DRY_RUN=false
-LOCAL=false
-SUMMARY=false
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=true ;;
-        --local)   LOCAL=true ;;
-        --summary) SUMMARY=true ;;
-    esac
-done
 
 # ====================== SUMMARY MODE =========================================
 if $SUMMARY; then
@@ -417,9 +464,30 @@ CORPUS_DIR="${SCRIPT_DIR}/data/synthetic/json"
 
 fetch_corpora() {
     echo "--- Checking source corpora in ${CORPUS_DIR} ---"
+
+    # Only fetch what the selected TASKS actually read. Most needle tasks use the noise
+    # or needle haystacks and need no corpus at all, so a run restricted to those --
+    # --sanity in particular -- should not pull down three datasets it will never open.
+    # Which tasks use the essay haystack is set in synthetic.yaml (type_haystack: essay).
+    local essay_tasks=" niah_single_2 niah_single_3 niah_multikey_1 niah_multivalue niah_multiquery "
+    local want_essay=false want_qa=false
+    for t in "${TASKS[@]}"; do
+        case "${essay_tasks}" in *" ${t} "*) want_essay=true ;; esac
+        case "${t}" in qa_*) want_qa=true ;; esac
+    done
+
+    if ! $want_essay && ! $want_qa; then
+        echo "    selected tasks need no external corpus, skipping"
+        return 0
+    fi
+
     local need_essay=false need_qa=false
-    [ -f "${CORPUS_DIR}/PaulGrahamEssays.json" ] || need_essay=true
-    { [ -f "${CORPUS_DIR}/squad.json" ] && [ -f "${CORPUS_DIR}/hotpotqa.json" ]; } || need_qa=true
+    if $want_essay; then
+        [ -f "${CORPUS_DIR}/PaulGrahamEssays.json" ] || need_essay=true
+    fi
+    if $want_qa; then
+        { [ -f "${CORPUS_DIR}/squad.json" ] && [ -f "${CORPUS_DIR}/hotpotqa.json" ]; } || need_qa=true
+    fi
 
     if ! $need_essay && ! $need_qa; then
         echo "    all corpora present, skipping download"
@@ -448,7 +516,11 @@ fetch_corpora() {
       fi
     )
 
-    for f in PaulGrahamEssays.json squad.json hotpotqa.json; do
+    # Verify only what was actually required, for the same reason.
+    local required=""
+    $want_essay && required="PaulGrahamEssays.json"
+    $want_qa && required="${required} squad.json hotpotqa.json"
+    for f in ${required}; do
         if [ ! -f "${CORPUS_DIR}/${f}" ]; then
             echo "ERROR: ${CORPUS_DIR}/${f} is still missing after download." >&2
             exit 1
@@ -502,6 +574,57 @@ generate_train_data() {
                 --random_seed "${TRAIN_SEED}"
         done
     done
+}
+
+# Pass/fail gate for --sanity. Reads the summary evaluate.py just wrote and compares
+# the score against SANITY_MIN_SCORE, exiting non-zero below it so the failure is
+# visible in the job's exit status rather than only in a log nobody reads.
+assert_sanity_score() {
+    local pred_dir="$1"
+    # evaluate.py names the file summary.csv for a multi-task run but
+    # summary-<task>.csv when only one task was evaluated, which is always the case
+    # here. Accept either rather than depending on that detail.
+    local summary=""
+    if [ -f "${pred_dir}/summary.csv" ]; then
+        summary="${pred_dir}/summary.csv"
+    else
+        summary="$(ls "${pred_dir}"/summary-*.csv 2>/dev/null | head -1 || true)"
+    fi
+    if [ -z "${summary}" ] || [ ! -f "${summary}" ]; then
+        echo "SANITY FAILED: no summary written in ${pred_dir}" >&2
+        exit 1
+    fi
+    python - "${summary}" "${SANITY_MIN_SCORE}" <<'PYSANITY'
+import csv, sys
+
+path, threshold = sys.argv[1], float(sys.argv[2])
+rows = [r for r in csv.reader(open(path)) if r]
+by_label = {r[0]: r[1:] for r in rows}
+tasks = by_label.get("Tasks", [])
+scores = by_label.get("Score", [])
+nulls = by_label.get("Nulls", [])
+if not tasks:
+    sys.exit(f"SANITY FAILED: malformed summary {path}")
+
+worst = None
+for i, task in enumerate(tasks):
+    score = float(scores[i])
+    null = nulls[i] if i < len(nulls) else "?"
+    print(f"    {task}: score={score} nulls={null}")
+    if worst is None or score < worst:
+        worst = score
+
+if worst < threshold:
+    sys.exit(
+        f"\nSANITY FAILED: score {worst} is below the {threshold} threshold.\n"
+        f"  A model cannot retrieve a needle from a context length it trained on.\n"
+        f"  Something in the train/predict path is broken; the grid would produce\n"
+        f"  zeros that look like a scientific result. Do not submit it.\n"
+        f"  Check, in order: the copy rate logged by RulerDataset, the initial loss\n"
+        f"  against ln(vocab_size), and whether val loss fell at all."
+    )
+print(f"\n    SANITY PASSED: {worst} >= {threshold}")
+PYSANITY
 }
 
 # ====================== PER-EXPERIMENT JOB ====================================
@@ -565,6 +688,11 @@ run_experiment() {
             --data_dir  "${PRED_DIR}" \
             --benchmark synthetic
     done
+
+    # In sanity mode this is a pass/fail gate, not a measurement.
+    if $SANITY; then
+        assert_sanity_score "${EXP_ROOT}/results/${EXP_NAME}/synthetic/${EVAL_SEQ_LENGTHS[0]}/pred"
+    fi
 
     # Every eval length is done and scored, so the weights have served their purpose:
     # predictions and summaries are on disk and are what the analysis reads. Deleting
@@ -671,7 +799,7 @@ set -euo pipefail
 # install would not be visible here and hardcoding false would strand every job with
 # no way to recover.
 $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC)
-$(declare -p KEEP_CHECKPOINTS)
+$(declare -p KEEP_CHECKPOINTS SANITY SANITY_MIN_SCORE)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
@@ -681,6 +809,7 @@ $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f check_gpu)
+$(declare -f assert_sanity_score)
 $(declare -f run_experiment)
 
 setup_env

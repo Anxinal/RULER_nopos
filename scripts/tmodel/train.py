@@ -29,6 +29,7 @@ Dependencies: torch, transformers   (+ datasets for --data_format text)
 """
 
 import argparse
+import functools
 import glob
 import json
 import logging
@@ -96,13 +97,67 @@ class RulerDataset(Dataset):
                         prefix = item.get("answer_prefix", "")
                         if not prefix:
                             n_missing_prefix += 1
-                        self.samples.append((item["input"] + prefix, outputs[0]))
+                        prompt, answer = self._build_pair(item["input"] + prefix, outputs)
+                        self.samples.append((prompt, answer))
 
         log.info("RulerDataset: loaded %d samples from %s", len(self.samples), data_dir)
         if n_missing_prefix:
             log.warning(
                 "RulerDataset: %d samples had no answer_prefix field; those prompts will "
                 "not match the ones used at prediction time.", n_missing_prefix,
+            )
+        self._report_copy_rate()
+
+    @staticmethod
+    def _build_pair(prompt, outputs):
+        """Return (prompt, answer) such that the answer is a verbatim copy of the source.
+
+        Two things matter here, and both were previously wrong.
+
+        **Whitespace sits on the answer, not the prompt.** Every answer occurs in the
+        haystack preceded by a space ("... is: 4527819."), and every answer_prefix ends
+        on "are" or ":". So the continuation the model should emit is " 4527819", whose
+        GPT-2 tokenisation is [' 45','278','19'] -- while encoding the bare "4527819"
+        gives ['45','278','19']. The two differ in the *first* token, which is exactly
+        where a copy circuit has to fire, so with the bare form the target is a sequence
+        that never appears in the input and retrieval cannot be learned by copying.
+        Trailing whitespace is stripped off the prompt for the same reason: a prompt
+        ending in a space gives that space its own token and moves the boundary.
+
+        **All answers are used, not just the first.** ``string_match_all`` credits each
+        reference found, so training on outputs[0] alone caps cwe at 10%, vt at 20%,
+        the multivalue/multiquery needles at 25% and fwe at 33%. The metric tests
+        substring containment and ignores formatting, so a plain space join scores the
+        same as RULER's numbered form while keeping the target short.
+        """
+        answer = " ".join(str(o) for o in outputs if str(o))
+        return prompt.rstrip(), " " + answer.lstrip()
+
+    def _report_copy_rate(self):
+        """Log how often the target is a verbatim token subsequence of the source.
+
+        This single number separates "this is a copy task the model can learn" from
+        "this is not", and nothing in the pipeline reported it before. Sampled, since
+        tokenising every source at 2048 tokens would be slow.
+        """
+        if not self.samples:
+            return
+        step = max(1, len(self.samples) // 200)
+        probe = self.samples[::step][:200]
+        copyable = 0
+        for src_text, tgt_text in probe:
+            src = self.tokenizer.encode(src_text)
+            tgt = self.tokenizer.encode(tgt_text)
+            if tgt and any(src[i:i + len(tgt)] == tgt
+                           for i in range(len(src) - len(tgt) + 1)):
+                copyable += 1
+        pct = 100.0 * copyable / len(probe)
+        log.info("RulerDataset: target is a verbatim copy of the source in %.0f%% of "
+                 "%d sampled examples", pct, len(probe))
+        if pct < 50:
+            log.warning(
+                "Most targets are NOT copies of the source. The model cannot solve "
+                "these by retrieval, only by memorisation -- check tokenisation."
             )
 
     def __len__(self):
@@ -275,7 +330,11 @@ def build_dataloaders(args, tokenizer, pad_id):
             train_ds, [n_train, n_val],
             generator=torch.Generator().manual_seed(args.seed),
         )
-        collate = lambda batch: ruler_collate(batch, pad_id)  # noqa: E731
+        # functools.partial, not a lambda: with num_workers > 0 the collate_fn is
+        # pickled to the worker processes, and a local lambda cannot be pickled under
+        # the spawn start method (the default on macOS; Linux forks, so this only
+        # shows up off-cluster).
+        collate = functools.partial(ruler_collate, pad_id=pad_id)
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.workers, pin_memory=True,
                                   collate_fn=collate)

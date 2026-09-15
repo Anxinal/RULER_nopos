@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"^# ====================== FLAGS\\\\|^DRY_RUN=false\\\\|^done$\\\\|^# ====================== EXPERIMENT GRID\\\\|^# ====================== SUMMARY\\\\|^MASK_CONFIGS=\\\\|^for spec in\" scripts/run_experiments.sh)",
+      "Bash(SANITY_TRAIN_SAMPLES=400 SANITY_EVAL_SAMPLES=25 SANITY_EPOCHS=4 SANITY_MIN_SCORE=40 VENV_DIR=/private/tmp/claude-501/-Users-anxiao-python-nopos-ruler/633b0a63-ec02-4e58-a429-90dc7f796280/scratchpad/venv EXP_ROOT=/private/tmp/claude-501/-Users-anxiao-python-nopos-ruler/633b0a63-ec02-4e58-a429-90dc7f796280/scratchpad/expReal bash scripts/run_experiments.sh --sanity --local)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

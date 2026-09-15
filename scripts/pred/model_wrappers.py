@@ -205,6 +205,13 @@ class MaskedTransformerModel:
     def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
         results = []
         for prompt in prompts:
+            # Strip trailing whitespace to match RulerDataset._build_pair. Training puts
+            # the separating space at the start of the answer, not the end of the prompt,
+            # so that the answer tokenises exactly as it does inside the haystack. Only
+            # the variable-tracking prefix ends in a space, but leaving it here would
+            # shift the token boundary for that task and undo the fix at eval time.
+            prompt = prompt.rstrip()
+
             # Measure before truncating so the amount dropped can be reported rather
             # than silently absorbed. Under the configured eval ladder this should
             # always be zero; a non-zero value means the ladder outgrew max_len.
