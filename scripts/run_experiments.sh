@@ -31,7 +31,7 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-48:00:00}"
+TIME="${TIME:-20:00:00}"
 # Checkpoints are deleted once a cell has been evaluated at every length, since
 # the predictions and summaries are what the analysis reads. At ~0.9 GB per cell
 # this is the difference between ~8 GB and ~0 GB of standing disk. Set true to keep
@@ -62,7 +62,7 @@ TORCH_SPEC="${TORCH_SPEC:-}"
 D_MODEL=1024
 NUM_HEADS=8
 NUM_LAYERS=8
-D_FF=2048
+D_FF=4096
 DROPOUT=0.2
 MAX_LEN=16384     # PE buffer length (must be >= longest EVAL seq length)
 TOKENIZER="gpt2"
@@ -84,21 +84,16 @@ TOKENIZER="gpt2"
 # the task, but if too many are skipped to reach TRAIN_SAMPLES the task still fails.
 # Verify with the probe in the header comment before a full submission.
 TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
-TRAIN_SAMPLES=5000          # samples per task per seq length
-TRAIN_SEED=0                # separate seed to avoid data leakage
+TRAIN_SAMPLES=10000         # samples per task per seq length
+TRAIN_SEED=42            # separate seed to avoid data leakage
 
 # 2048 is the training length, then 2x and 4x it.
-#
-# The in-distribution point is NOT optional. Without it a score of 0.0 at 4096 is
-# uninterpretable: "the model learned the task but cannot extrapolate" and "the model
-# never learned the task at all" produce identical numbers. Only the 2048 column tells
-# them apart, and it is the cheapest of the three to run.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=500
 EVAL_SEED=42                # RULER default
 
 # ====================== TRAINING =============================================
-EPOCHS=20
+EPOCHS=15
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 LR=2e-4
@@ -268,14 +263,6 @@ mkdir -p "${LOG_DIR}"
 # ====================== ENVIRONMENT PREFLIGHT ================================
 # Report every missing package at once. Without this a missing dependency fails one
 # job at a time: submit, queue, fail, install one package, resubmit, repeat.
-# NOTE: this deliberately runs `python`, not `python3`, because data/prepare.py
-# shells out to a bare `python` -- so if that name is not on PATH, this is where it
-# surfaces rather than thirteen lines deep in a captured subprocess stderr.
-# Create the virtualenv if it is not there, activate it, and populate it from
-# requirements.txt. Used by the Slurm jobs and by --local alike: without it, --local
-# silently runs against whatever `python` the login shell has, which is usually the
-# unwritable system interpreter.
-#
 # Activation is done by hand rather than by sourcing bin/activate, because that script
 # touches unset variables and this runs under 'set -u'. Putting the venv's bin first on
 # PATH also makes a bare `python` resolve to it, which data/prepare.py depends on when
@@ -580,18 +567,9 @@ generate_train_data() {
 # the score against SANITY_MIN_SCORE, exiting non-zero below it so the failure is
 # visible in the job's exit status rather than only in a log nobody reads.
 assert_sanity_score() {
-    local pred_dir="$1"
-    # evaluate.py names the file summary.csv for a multi-task run but
-    # summary-<task>.csv when only one task was evaluated, which is always the case
-    # here. Accept either rather than depending on that detail.
-    local summary=""
-    if [ -f "${pred_dir}/summary.csv" ]; then
-        summary="${pred_dir}/summary.csv"
-    else
-        summary="$(ls "${pred_dir}"/summary-*.csv 2>/dev/null | head -1 || true)"
-    fi
-    if [ -z "${summary}" ] || [ ! -f "${summary}" ]; then
-        echo "SANITY FAILED: no summary written in ${pred_dir}" >&2
+    local summary="$1"
+    if [ ! -f "${summary}" ]; then
+        echo "SANITY FAILED: no summary at ${summary}" >&2
         exit 1
     fi
     python - "${summary}" "${SANITY_MIN_SCORE}" <<'PYSANITY'
@@ -691,7 +669,7 @@ run_experiment() {
 
     # In sanity mode this is a pass/fail gate, not a measurement.
     if $SANITY; then
-        assert_sanity_score "${EXP_ROOT}/results/${EXP_NAME}/synthetic/${EVAL_SEQ_LENGTHS[0]}/pred"
+        assert_sanity_score "${EXP_ROOT}/results/${EXP_NAME}/synthetic/${EVAL_SEQ_LENGTHS[0]}/pred/summary.csv"
     fi
 
     # Every eval length is done and scored, so the weights have served their purpose:
