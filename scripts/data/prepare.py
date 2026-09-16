@@ -165,15 +165,16 @@ def main():
                 f"See the generator stderr above."
             )
 
-    if not os.path.exists(save_file):
-        raise SystemExit(
-            f"Data generation reported success but {save_file} does not exist."
-        )
+        if not os.path.exists(save_file):
+            raise SystemExit(
+                f"Data generation reported success but {save_file} does not exist."
+            )
 
         print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")
         print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
     else:
-        print(f"Skip preparing {args.task} with lines: {args.num_samples} to {save_file} (file exists)")
+        print(f"Skip preparing {args.task} with lines: {args.num_samples} to {save_file} "
+              f"(already has {args.num_samples} lines)")
     
 if __name__ == '__main__':
     main()

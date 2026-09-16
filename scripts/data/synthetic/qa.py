@@ -244,12 +244,30 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     # rather than mangled, and the next question is tried instead. Length is compared
     # explicitly rather than via assert-and-bare-except, so a genuine bug propagates
     # with its own traceback instead of being relabelled as a length problem.
+    # Unlike the synthetic tasks, the QA pool is finite: SQuAD dev-v2.0 yields 5,928
+    # answerable questions and HotpotQA dev about 7,405. Asking for more samples than
+    # that is reasonable -- a question paired with a different draw of distractor
+    # documents is a genuinely different retrieval problem, since the gold document
+    # lands in a different haystack at a different position. So wrap around rather than
+    # failing, and report the reuse factor, because repeating question/answer pairs does
+    # make them easier to memorise and that is worth knowing when reading the scores.
     n_skipped = 0
-    qa_index = args.pre_samples
-    n_questions = len(QAS)
+    n_available = len(QAS) - args.pre_samples
+    if n_available <= 0:
+        raise RuntimeError(
+            f"qa/{args.save_name}: no questions left after skipping "
+            f"{args.pre_samples} (pool holds {len(QAS)})."
+        )
+
+    attempt = 0
+    # Bounded so an unfittable pool terminates instead of spinning: every question gets
+    # a couple of chances beyond the number of samples requested.
+    max_attempts = num_samples * 2 + n_available
     progress = tqdm(total=num_samples)
 
-    while len(write_jsons) < num_samples and qa_index < n_questions:
+    while len(write_jsons) < num_samples and attempt < max_attempts:
+        qa_index = args.pre_samples + (attempt % n_available)
+        attempt += 1
         floor = len(QAS[qa_index]['context'])
         used_docs = max(num_docs, floor)
         fits = False
@@ -266,7 +284,6 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
 
         if not fits:
             n_skipped += 1
-            qa_index += 1
             continue
 
         if args.remove_newline_tab:
@@ -284,20 +301,27 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
         }
         write_jsons.append(formatted_output)
         progress.update(1)
-        qa_index += 1
 
     progress.close()
 
     if n_skipped:
         logger.warning(
-            f'{n_skipped} question(s) skipped: their own documents exceed '
+            f'{n_skipped} question attempt(s) skipped: their own documents exceed '
             f'max_seq_length={max_seq_length}.'
+        )
+    if num_samples > n_available:
+        logger.warning(
+            f'qa/{args.save_name}: pool holds {n_available} questions but {num_samples} '
+            f'samples were requested, so each question is reused about '
+            f'{num_samples / n_available:.1f}x with a different draw of distractor '
+            f'documents. The haystacks differ, but the question/answer pairs repeat, '
+            f'which makes them easier to memorise than the synthetic tasks.'
         )
     if len(write_jsons) < num_samples:
         raise RuntimeError(
             f"qa/{args.save_name}: only {len(write_jsons)} of {num_samples} samples fit "
-            f"within max_seq_length={max_seq_length} after trying all "
-            f"{n_questions - args.pre_samples} questions ({n_skipped} skipped). "
+            f"within max_seq_length={max_seq_length} after {attempt} attempts over a "
+            f"pool of {n_available} questions ({n_skipped} skipped). "
             f"Raise --max_seq_length or lower --num_samples."
         )
 
