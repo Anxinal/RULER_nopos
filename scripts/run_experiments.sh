@@ -31,7 +31,7 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-20:00:00}"
+TIME="${TIME:-12:00:00}"
 # Checkpoints are deleted once a cell has been evaluated at every length, since
 # the predictions and summaries are what the analysis reads. At ~0.9 GB per cell
 # this is the difference between ~8 GB and ~0 GB of standing disk. Set true to keep
@@ -93,7 +93,7 @@ EVAL_SAMPLES=500
 EVAL_SEED=42                # RULER default
 
 # ====================== TRAINING =============================================
-EPOCHS=15
+EPOCHS=20
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 LR=2e-4
