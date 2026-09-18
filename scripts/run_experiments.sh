@@ -98,6 +98,28 @@ BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 LR=2e-4
 WARMUP=1000
+# Early stopping. EPOCHS is now a cap, not a target: a cell stops once val loss has
+# been flat for EARLY_STOP_PATIENCE epochs. The mixed-mask arm converged around epoch 8,
+# so most cells should stop well short of the cap and free GPU time.
+#
+# EARLY_STOP_MIN_EPOCHS is the safeguard that makes this usable here. A slow-starting
+# arm (absolute positional encodings at long context) sits at the answer-prior loss for
+# a long stretch before retrieval forms and the loss drops sharply. Stopping inside that
+# stretch would record a premature halt as convergence -- exactly the failure this
+# experiment already spent a round chasing.
+#
+# The floor has to sit ABOVE the longest plausible pre-onset plateau, not merely above
+# the convergence epoch. Simulated against a slow-onset curve that drops at epoch 13, a
+# floor of 8, 10 or 12 all stop it at the floor -- patience has already run out by the
+# time the floor is reached, so it never sees its own improvement. 14 survives it and
+# still stops a converged arm 6 epochs short of the cap.
+#
+# The two errors are not symmetric: a floor set too high wastes a few ~30-minute epochs,
+# while one set too low makes a slow arm look broken and costs another debugging round.
+# Lower it only after checking a slow arm's real curve for a long flat stretch.
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-4}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-1e-2}"
+EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-14}"
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 SEED=42
@@ -676,6 +698,9 @@ run_experiment() {
         --epochs       "${EPOCHS}" \
         --batch_size   "${BATCH_SIZE}" \
         --grad_accum   "${GRAD_ACCUM}" \
+        --early_stop_patience   "${EARLY_STOP_PATIENCE}" \
+        --early_stop_min_delta  "${EARLY_STOP_MIN_DELTA}" \
+        --early_stop_min_epochs "${EARLY_STOP_MIN_EPOCHS}" \
         --lr           "${LR}" \
         --warmup_steps "${WARMUP}" \
         --seed         "${SEED}" \
@@ -828,6 +853,7 @@ $(declare -p KEEP_CHECKPOINTS SANITY SANITY_MIN_SCORE)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
+             EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS \
              EVAL_SEED TASKS SCRIPT_DIR)
 $(declare -f setup_env)
 $(declare -f _missing_packages)

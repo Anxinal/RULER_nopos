@@ -477,6 +477,9 @@ def main(args):
 
     # ---- train ----------------------------------------------------
     best_val = float("inf")
+    best_epoch = 0
+    stale = 0            # consecutive epochs without a meaningful val improvement
+    stop_reason = "epoch cap"
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
 
     for epoch in range(1, args.epochs + 1):
@@ -506,17 +509,52 @@ def main(args):
         # last.pt is not read by anything downstream; prediction loads best.pt.
         if args.save_last:
             torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
+        # Two separate questions, deliberately not conflated:
+        #   * is this the best model so far?          -> any improvement, checkpoint it
+        #   * has training stopped making progress?   -> improvement must beat min_delta,
+        #                                                so noise does not reset patience
+        prev_best = best_val
         if val_loss < best_val:
             best_val = val_loss
+            best_epoch = epoch
             torch.save(ckpt, os.path.join(args.output_dir, "best.pt"))
             log.info("  * new best checkpoint (val_loss=%.4f)", val_loss)
+
+        if val_loss < prev_best - args.early_stop_min_delta:
+            stale = 0
+        else:
+            stale += 1
 
         with open(metrics_path, "a") as f:
             f.write(json.dumps(dict(epoch=epoch, train_loss=train_loss,
                                     train_ppl=train_ppl, val_loss=val_loss,
-                                    val_ppl=val_ppl)) + "\n")
+                                    val_ppl=val_ppl, stale=stale)) + "\n")
 
-    log.info("Done. Best val_loss=%.4f  Saved to %s", best_val, args.output_dir)
+        if args.early_stop_patience > 0 and stale >= args.early_stop_patience:
+            # The floor exists because "flat" does not always mean "finished". An arm
+            # whose retrieval circuit has not formed yet sits at the answer-prior loss
+            # for a long stretch and then drops sharply; absolute positional encodings
+            # do exactly this at long context. Stopping during that stretch would
+            # record a converged-looking failure that is really a premature halt.
+            if epoch < args.early_stop_min_epochs:
+                log.info("  (val flat for %d epochs, but below the %d-epoch floor; "
+                         "continuing)", stale, args.early_stop_min_epochs)
+            else:
+                stop_reason = (f"val loss flat for {stale} epochs "
+                               f"(min_delta={args.early_stop_min_delta})")
+                log.info("Early stop at epoch %d: %s", epoch, stop_reason)
+                break
+
+    last_lr = scheduler.get_last_lr()[0] if scheduler else args.lr
+    log.info("Done (%s). Best val_loss=%.4f at epoch %d/%d  Saved to %s",
+             stop_reason, best_val, best_epoch, args.epochs, args.output_dir)
+    if stop_reason != "epoch cap":
+        # Cosine is sized from the epoch cap, so an early stop leaves the LR partway
+        # down its curve. Worth seeing, since a still-high LR means annealing might
+        # have bought more had training continued.
+        log.info("  note: stopped mid-schedule, LR was %.2e (peak %.2e). If that is "
+                 "still high, some of the remaining gain may be annealing, not capacity.",
+                 last_lr, args.lr)
 
 
 # ------------------------------------------------------------------
@@ -563,6 +601,19 @@ def parse_args():
     g = p.add_argument_group("training")
     g.add_argument("--epochs", type=int, default=10)
     g.add_argument("--batch_size", type=int, default=8)
+    g.add_argument("--early_stop_patience", type=int, default=0,
+                   help="Stop after this many consecutive epochs without a val-loss "
+                        "improvement larger than --early_stop_min_delta. 0 disables it, "
+                        "and training runs to --epochs.")
+    g.add_argument("--early_stop_min_delta", type=float, default=1e-2,
+                   help="An improvement smaller than this counts as no improvement, so "
+                        "epoch-to-epoch noise does not keep resetting the patience "
+                        "counter.")
+    g.add_argument("--early_stop_min_epochs", type=int, default=14,
+                   help="Never stop before this epoch, however flat val loss looks. An "
+                        "arm whose retrieval circuit has not formed yet sits at the "
+                        "answer-prior loss for a long stretch before dropping sharply; "
+                        "stopping there would record a premature halt as convergence.")
     g.add_argument("--grad_accum", type=int, default=1,
                    help="Batches to accumulate before each optimizer step. Effective "
                         "batch size is batch_size * grad_accum.")
