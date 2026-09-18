@@ -209,6 +209,29 @@ else
     TASKS=("${synthetic[@]}")
 fi
 
+# Tasks where every arm scores ~0 carry no signal and still cost a full prediction pass.
+# Both of these use the "needle" haystack: the distractors are themselves key/value
+# needles, so answering requires binding the right key among many near-identical ones.
+# No arm has separated from zero on either (best observed 0.8).
+#
+# NOTE: niah_single_3 is deliberately NOT here. Its answer is a 33-chunk uuid, which is
+# why a bag-of-tokens model scores 0 on it while the masked arms reach 92-99. That makes
+# it the single cleanest test of positional ability in the suite.
+EXCLUDE_TASKS=("niah_multikey_2" "niah_multikey_3")
+
+if ! $SANITY && [ ${#EXCLUDE_TASKS[@]} -gt 0 ]; then
+    _kept=()
+    for _t in "${TASKS[@]}"; do
+        _skip=false
+        for _x in "${EXCLUDE_TASKS[@]}"; do
+            if [ "${_t}" = "${_x}" ]; then _skip=true; fi
+        done
+        if ! $_skip; then _kept+=("${_t}"); fi
+    done
+    echo "Tasks: ${#_kept[@]} of ${#TASKS[@]} (excluded: ${EXCLUDE_TASKS[*]})"
+    TASKS=("${_kept[@]}")
+fi
+
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
 LOG_DIR="${EXP_ROOT}/slurm_logs"
@@ -456,7 +479,7 @@ fetch_corpora() {
     # or needle haystacks and need no corpus at all, so a run restricted to those --
     # --sanity in particular -- should not pull down three datasets it will never open.
     # Which tasks use the essay haystack is set in synthetic.yaml (type_haystack: essay).
-    local essay_tasks=" niah_single_2 niah_single_3 niah_multikey_1 niah_multivalue niah_multiquery "
+    local essay_tasks=" niah_single_2 niah_multikey_1 niah_multivalue niah_multiquery "
     local want_essay=false want_qa=false
     for t in "${TASKS[@]}"; do
         case "${essay_tasks}" in *" ${t} "*) want_essay=true ;; esac
@@ -605,6 +628,27 @@ print(f"\n    SANITY PASSED: {worst} >= {threshold}")
 PYSANITY
 }
 
+# Longest answer in a task's eval set, in tokens, plus a small margin. Used to cap
+# generation so a model cannot hedge -- emit several candidate orderings and let the
+# substring metric credit one of them. The margin covers EOS and one stray token; it is
+# deliberately too small to fit a second candidate answer.
+#
+# Mirrors how RulerDataset builds the training target: " " + " ".join(outputs).
+answer_token_cap() {
+    local jsonl="$1"
+    python - "${jsonl}" "${TOKENIZER}" <<'PYCAP'
+import json, sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(sys.argv[2])
+rows = [json.loads(l) for l in open(sys.argv[1])]
+longest = max(
+    len(tok.encode(" " + " ".join(str(o) for o in r.get("outputs", []) if str(o))))
+    for r in rows
+)
+print(longest + 2)
+PYCAP
+}
+
 # ====================== PER-EXPERIMENT JOB ====================================
 run_experiment() {
     local pe="$1" enc_mask="$2"
@@ -648,7 +692,10 @@ run_experiment() {
 
         for TASK in "${TASKS[@]}"; do
             # predict
+            local CAP
+            CAP="$(answer_token_cap "${EVAL_DATA}/${TASK}/validation.jsonl")"
             python "${SCRIPT_DIR}/pred/call_api.py" \
+                --max_new_tokens "${CAP}" \
                 --data_dir  "${EVAL_DATA}" \
                 --save_dir  "${PRED_DIR}" \
                 --benchmark synthetic \
@@ -788,6 +835,7 @@ $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f check_gpu)
 $(declare -f assert_sanity_score)
+$(declare -f answer_token_cap)
 $(declare -f run_experiment)
 
 setup_env

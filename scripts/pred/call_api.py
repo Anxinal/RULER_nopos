@@ -96,6 +96,12 @@ parser.add_argument("--stop_words", type=str, default='')
 parser.add_argument("--sliding_window_size", type=int)
 parser.add_argument("--threads", type=int, default=4)
 parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--max_new_tokens", type=int, default=None,
+                    help="Override the generation budget. The per-task "
+                         "tokens_to_generate in data/synthetic/constants.py is ALSO used "
+                         "to size the haystack during data generation, so it must not be "
+                         "edited to shorten generation -- that would change the datasets. "
+                         "This overrides generation only.")
 
 args = parser.parse_args()
 args.stop_words = list(filter(None, args.stop_words.split(',')))
@@ -259,7 +265,17 @@ def main():
         data = read_manifest(task_file)
 
     # Load api
-    llm = get_llm(config['tokens_to_generate'])
+    # A generous generation budget lets a model that cannot determine the answer hedge:
+    # emit several candidate orderings and let the substring metric credit one of them.
+    # niah allows 128 tokens for a ~4-token answer, which is enough to cover every
+    # ordering of its chunks. Capping near the true answer length forces the model to
+    # commit to one answer, so the score measures retrieval rather than output budget.
+    gen_budget = config['tokens_to_generate']
+    if args.max_new_tokens is not None:
+        gen_budget = min(gen_budget, args.max_new_tokens)
+        print(f"Generation budget capped at {gen_budget} tokens "
+              f"(task default {config['tokens_to_generate']})")
+    llm = get_llm(gen_budget)
 
     def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list):
         nonlocal llm
