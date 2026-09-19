@@ -548,6 +548,15 @@ def main(args):
     last_lr = scheduler.get_last_lr()[0] if scheduler else args.lr
     log.info("Done (%s). Best val_loss=%.4f at epoch %d/%d  Saved to %s",
              stop_reason, best_val, best_epoch, args.epochs, args.output_dir)
+    # A marker that training RAN TO COMPLETION, as opposed to a checkpoint merely
+    # existing. best.pt is rewritten at every improvement, so a job killed mid-training
+    # leaves one behind too -- and reusing that to skip training would silently evaluate
+    # an undertrained model. Written last, so it can only exist if the loop finished.
+    with open(os.path.join(args.output_dir, "TRAINING_COMPLETE.json"), "w") as f:
+        json.dump(dict(best_val_loss=best_val, best_epoch=best_epoch,
+                       epochs_run=epoch, epoch_cap=args.epochs,
+                       stop_reason=stop_reason), f, indent=2)
+
     if stop_reason != "epoch cap":
         # Cosine is sized from the epoch cap, so an early stop leaves the LR partway
         # down its curve. Worth seeing, since a still-high LR means annealing might
