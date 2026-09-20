@@ -136,12 +136,13 @@ WARMUP=1000
 #
 # MIN_EPOCHS only suppresses the break; the stale counter keeps climbing underneath it.
 # So an arm that plateaus early stops at exactly MIN_EPOCHS, not MIN_EPOCHS + PATIENCE.
-# With MIN_EPOCHS <= PATIENCE the floor is inert, since reaching stale >= PATIENCE
-# already implies at least that many epochs have elapsed: at 8 and 8, PATIENCE alone
-# governs. Raise MIN_EPOCHS above PATIENCE if a slow arm needs a guaranteed floor.
+# The floor only bites when MIN_EPOCHS > PATIENCE -- otherwise reaching stale >= PATIENCE
+# already implies that many epochs have elapsed and patience alone governs. At 12 and 8
+# the floor is live: a cell flat from the start burns patience at epoch 8 and is then
+# held to epoch 12 before it may stop.
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
-EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-8}"
+EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
 # Floor the cosine schedule at this fraction of the peak LR rather than decaying to 0.
 # Escape from the format basin is a circuit formation, not a smooth descent, so it needs
 # a step size large enough to explore. The arm that solved the task escaped at epoch 8
