@@ -31,7 +31,7 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-18:00:00}"
+TIME="${TIME:-12:00:00}"
 # Checkpoints are deleted once a cell has been evaluated at every length, since
 # the predictions and summaries are what the analysis reads. At ~0.9 GB per cell
 # this is the difference between ~8 GB and ~0 GB of standing disk. Set true to keep
@@ -64,11 +64,28 @@ PIP_ARGS="${PIP_ARGS:-}"
 TORCH_SPEC="${TORCH_SPEC:-}"
 
 # ====================== MODEL ================================================
-D_MODEL=1024
+# 286M -> ~70M. Capacity was never the binding constraint: the arm that works reached
+# 98 at the larger size, and a <1M-parameter reproduction of the same task structure
+# reached 83-100%. Excess capacity actively works against us here -- 286M parameters
+# against 67.5k unique samples is heavy pressure to memorise the answer FORMAT, which
+# is precisely the basin every failing cell settled into (ppl ~49, 3-6 distinct outputs
+# for 1000 questions). Less room to memorise biases toward the general solution, and
+# ~4x cheaper cells make the remaining open questions answerable in hours not days.
+#
+# NUM_HEADS stays 8: the mask specs are one code per head, and CCCCFFFF's 4-causal /
+# 4-future split is the object under study. head_dim is 512/8 = 64, the usual value.
+D_MODEL=512
 NUM_HEADS=8
-NUM_LAYERS=8
-D_FF=4096
-DROPOUT=0.2
+NUM_LAYERS=6
+D_FF=2048
+# 0.0, not 0.2. embed_dropout is applied to the SUM of the token embedding and the
+# additive positional encoding, so for the sinusoidal arms it randomly deletes 20% of a
+# vector in which content and position are already entangled -- a penalty RoPE and ALiBi
+# never pay, since their positional signal lives in the attention scores and is never
+# dropped. Both configurations known to learn this task (the --sanity control, and the
+# small-scale reproduction) ran at 0.0. Raise it only if val loss starts diverging from
+# train; with random per-sample needles there is little here to overfit.
+DROPOUT=0.0
 MAX_LEN=16384     # PE buffer length (must be >= longest EVAL seq length)
 TOKENIZER="gpt2"
 
@@ -86,8 +103,11 @@ TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
 # Samples per task per seq length -- PER TASK. The three-task list below trains on
 # 30k samples where the eleven-task run produced 110k, so if a cell underfits where
 # it previously converged, raise this before reaching for the model or the schedule.
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-15000}"   # samples per task per seq length
-TRAIN_SEED=42            # separate seed to avoid data leakage
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-25000}"   # samples per task per seq length
+# MUST differ from EVAL_SEED. Both were 42, which made the two prepare.py runs produce
+# identical RNG streams at the same --max_seq_length, so every eval sample at the train
+# length was literally a training sample and that whole column measured memorisation.
+TRAIN_SEED=1234
 
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
@@ -95,33 +115,38 @@ EVAL_SAMPLES=1000
 EVAL_SEED=42                # RULER default
 
 # ====================== TRAINING =============================================
-EPOCHS=25
+EPOCHS=30
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
-LR=2e-4
+LR=3e-4                     # the --sanity control that passes uses 3e-4
 WARMUP=1000
-# Early stopping. EPOCHS is now a cap, not a target: a cell stops once val loss has
-# been flat for EARLY_STOP_PATIENCE epochs. The mixed-mask arm converged around epoch 8,
-# so most cells should stop well short of the cap and free GPU time.
+# Early stopping. EPOCHS is a cap, not a target: a cell stops once val loss has failed
+# to beat its running best by MIN_DELTA for PATIENCE consecutive epochs.
 #
-# EARLY_STOP_MIN_EPOCHS is the safeguard that makes this usable here. A slow-starting
-# arm (absolute positional encodings at long context) sits at the answer-prior loss for
-# a long stretch before retrieval forms and the loss drops sharply. Stopping inside that
-# stretch would record a premature halt as convergence -- exactly the failure this
-# experiment already spent a round chasing.
+# Note MIN_DELTA is measured against the running BEST, not the previous epoch, so the
+# bar ratchets upward. An epoch can write a new best.pt and still increment the stale
+# counter, if it improved by less than MIN_DELTA.
 #
-# The floor has to sit ABOVE the longest plausible pre-onset plateau, not merely above
-# the convergence epoch. Simulated against a slow-onset curve that drops at epoch 13, a
-# floor of 8, 10 or 12 all stop it at the floor -- patience has already run out by the
-# time the floor is reached, so it never sees its own improvement. 14 survives it and
-# still stops a converged arm 6 epochs short of the cap.
+# These gate on pooled val loss, which is exactly the quantity the degenerate solution
+# already optimises: a model that memorises the answer FORMAT and ignores the context
+# settles at ppl ~49 and sits there, val loss flattens, and patience expires while the
+# retrieval circuit has not begun to form. The previous settings certified that basin as
+# "converged" at epoch 17 in every failing cell. The real remedy is MIN_LR_FRAC below --
+# those cells were at 5e-5 by the time they stopped, far too small to escape.
 #
-# The two errors are not symmetric: a floor set too high wastes a few ~30-minute epochs,
-# while one set too low makes a slow arm look broken and costs another debugging round.
-# Lower it only after checking a slow arm's real curve for a long flat stretch.
-EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-4}"
-EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-1e-2}"
-EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-14}"
+# MIN_EPOCHS only suppresses the break; the stale counter keeps climbing underneath it.
+# So an arm that plateaus early stops at exactly MIN_EPOCHS, not MIN_EPOCHS + PATIENCE.
+# With MIN_EPOCHS <= PATIENCE the floor is inert, since reaching stale >= PATIENCE
+# already implies at least that many epochs have elapsed: at 8 and 8, PATIENCE alone
+# governs. Raise MIN_EPOCHS above PATIENCE if a slow arm needs a guaranteed floor.
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
+EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-8}"
+# Floor the cosine schedule at this fraction of the peak LR rather than decaying to 0.
+# Escape from the format basin is a circuit formation, not a smooth descent, so it needs
+# a step size large enough to explore. The arm that solved the task escaped at epoch 8
+# with LR near peak; failing arms were at 5e-5 by the time they stopped.
+MIN_LR_FRAC="${MIN_LR_FRAC:-0.25}"
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 SEED=42
@@ -691,7 +716,10 @@ longest = max(
     len(tok.encode(" " + " ".join(str(o) for o in r.get("outputs", []) if str(o))))
     for r in rows
 )
-print(longest + 2)
+# Headroom, not +2. The cap was tight enough that a model whose output tokenises
+# slightly differently from the gold string ran out of budget mid-answer and scored 0
+# for a reason unrelated to retrieval -- visible as truncated 4-group uuids.
+print(longest + 16)
 PYCAP
 }
 
@@ -748,6 +776,7 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
         --early_stop_min_epochs "${EARLY_STOP_MIN_EPOCHS}" \
         --lr           "${LR}" \
         --warmup_steps "${WARMUP}" \
+        --min_lr_frac  "${MIN_LR_FRAC}" \
         --seed         "${SEED}" \
         --fp16 \
         --output_dir   "${EXP_DIR}"
@@ -899,7 +928,7 @@ $(declare -p KEEP_CHECKPOINTS RETRAIN SANITY SANITY_MIN_SCORE)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
-             EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS \
+             EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC \
              EVAL_SEED TASKS SCRIPT_DIR)
 $(declare -f setup_env)
 $(declare -f _missing_packages)

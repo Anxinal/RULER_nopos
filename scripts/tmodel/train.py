@@ -234,12 +234,23 @@ def tokenize_split(tokenizer, dataset_name, subset, split, max_tokens=None):
 # LR schedule
 # ------------------------------------------------------------------
 
-def cosine_with_warmup(optimizer, warmup: int, total: int):
+def cosine_with_warmup(optimizer, warmup: int, total: int, min_frac: float = 0.0):
+    """Cosine decay with warmup, bottoming out at *min_frac* of the peak LR.
+
+    The floor is not cosmetic. Escaping the answer-prior basin -- where the model emits
+    a memorised output format and ignores the context entirely -- is a discrete circuit
+    formation rather than a smooth descent, so it depends on the step size still being
+    large enough to explore. The one arm that solved the task did so around epoch 8,
+    while the LR was still near peak; arms that were still searching at epoch 14 were
+    already down to 9e-5, and by 17 to 5e-5. Decaying to exactly zero turns "this
+    circuit is harder to find" into "this circuit is never found".
+    """
     def _lr(step):
         if step < warmup:
             return step / max(1, warmup)
         progress = (step - warmup) / max(1, total - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_frac + (1.0 - min_frac) * cosine
     return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr)
 
 
@@ -429,7 +440,8 @@ def main(args):
         len(train_loader), args.grad_accum, steps_per_epoch, total_steps, warmup,
         args.batch_size * args.grad_accum,
     )
-    scheduler = cosine_with_warmup(optimizer, warmup, total_steps)
+    scheduler = cosine_with_warmup(optimizer, warmup, total_steps,
+                                   min_frac=args.min_lr_frac)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
 
     # Sanity-check the initialisation before spending hours on it. An untrained model
@@ -630,6 +642,9 @@ def parse_args():
     g.add_argument("--weight_decay", type=float, default=0.01)
     g.add_argument("--grad_clip", type=float, default=1.0)
     g.add_argument("--warmup_steps", type=int, default=1000)
+    g.add_argument("--min_lr_frac", type=float, default=0.0,
+                   help="Floor the cosine schedule at this fraction of the peak LR "
+                        "instead of decaying to zero. See cosine_with_warmup.")
     g.add_argument("--fp16", action="store_true")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--workers", type=int, default=4)
