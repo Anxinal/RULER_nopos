@@ -60,6 +60,11 @@ parser.add_argument("--random_seed", type=int, default=42)
 parser.add_argument("--model_template_type", type=str, default='base', help='Options in `template.py`')
 parser.add_argument("--remove_newline_tab", action='store_true', help='remove `\n` and `\t` in all strings.')
 parser.add_argument("--chunk_idx", type=int, default=0, help='index of current split chunk')
+parser.add_argument("--qa_start", type=int, default=0,
+                    help='QA only: first question index this run may use')
+parser.add_argument("--qa_end", type=int, default=-1,
+                    help='QA only: exclusive last question index (-1 = whole pool). '
+                         'Give train and eval disjoint ranges or eval questions leak into training.')
 parser.add_argument("--chunk_amount", type=int, default=1, help='size of split chunk')
 parser.add_argument("--prepare_for_ns", action='store_true')
 
@@ -104,7 +109,7 @@ def main():
     # Split task into multiple chunks 
     chunks = [(args.num_samples // args.chunk_amount) + (1 if i < args.num_samples % args.chunk_amount else 0) for i in range(args.chunk_amount)]
     num_samples = chunks[args.chunk_idx]
-    pre_samples = sum(chunks[:args.chunk_idx])
+    pre_samples = args.qa_start + sum(chunks[:args.chunk_idx])
     
     random_seed = args.random_seed + args.chunk_idx
 
@@ -134,7 +139,7 @@ def main():
             --random_seed {random_seed} \
             {additional_args} \
             {f"--remove_newline_tab" if args.remove_newline_tab else ""} \
-            {f"--pre_samples {pre_samples}" if config['task'] == 'qa' else ""} \
+            {f"--pre_samples {pre_samples} --q_end {args.qa_end}" if config['task'] == 'qa' else ""} \
             --template "{config['template']}" \
             """
             if args.prepare_for_ns:

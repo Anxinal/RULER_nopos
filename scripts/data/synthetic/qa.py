@@ -55,6 +55,10 @@ parser.add_argument("--max_seq_length", type=int, required=True, help='max seque
 parser.add_argument("--tokens_to_generate", type=int, required=True, help='expected generated token amount.')
 parser.add_argument("--num_samples", type=int, required=True, help='number of samples to generate')
 parser.add_argument("--pre_samples", type=int, default=0, help='number of samples are already generated')
+parser.add_argument("--q_end", type=int, default=-1,
+                    help='exclusive upper bound on the question index; -1 means the whole pool. '
+                         'With --pre_samples this confines a run to [pre_samples, q_end), which is '
+                         'how training and evaluation are kept on disjoint questions.')
 parser.add_argument("--random_seed", type=int, default=42)
 parser.add_argument("--template", type=str, required=True, help='prompt template')
 parser.add_argument("--remove_newline_tab", action='store_true', help='remove `\n` and `\t` in all strings.')
@@ -163,9 +167,16 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     # The probe must be a question that actually fits. Using QAS[0] unconditionally lets
     # one unlucky first question abort a task that every other question could have
     # satisfied, since document lengths vary a lot between questions.
+    # Upper bound on the question index. Train and eval draw from the same fixed pool and
+    # would otherwise both start at question 0 -- the random seed only reshuffles the
+    # distractor documents, never which questions are asked -- so every eval question and
+    # its gold answer would also be a training target, and a model could score by
+    # recalling question -> answer without reading the context at all.
+    q_end = len(QAS) if args.q_end < 0 else min(args.q_end, len(QAS))
+
     PROBE_WINDOW = 200
     probe_index = None
-    for candidate in range(args.pre_samples, min(len(QAS), args.pre_samples + PROBE_WINDOW)):
+    for candidate in range(args.pre_samples, min(q_end, args.pre_samples + PROBE_WINDOW)):
         floor = max(1, len(QAS[candidate]['context']))
         text, _ = generate_input_output(candidate, floor)
         if len(TOKENIZER.text_to_tokens(text)) + tokens_to_generate <= max_seq_length:
@@ -252,11 +263,11 @@ def generate_samples(num_samples: int, max_seq_length: int, save_dir: str, incre
     # failing, and report the reuse factor, because repeating question/answer pairs does
     # make them easier to memorise and that is worth knowing when reading the scores.
     n_skipped = 0
-    n_available = len(QAS) - args.pre_samples
+    n_available = q_end - args.pre_samples
     if n_available <= 0:
         raise RuntimeError(
-            f"qa/{args.save_name}: no questions left after skipping "
-            f"{args.pre_samples} (pool holds {len(QAS)})."
+            f"qa/{args.save_name}: no questions in [{args.pre_samples}, {q_end}) "
+            f"(pool holds {len(QAS)})."
         )
 
     attempt = 0

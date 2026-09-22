@@ -100,9 +100,9 @@ TOKENIZER="gpt2"
 # point of the experiment, and it is also much cheaper: cost per sample grows with
 # the square of the sequence length in attention.
 TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
-# Samples per task per seq length -- PER TASK. The three-task list below trains on
-# 30k samples where the eleven-task run produced 110k, so if a cell underfits where
-# it previously converged, raise this before reaching for the model or the schedule.
+# Samples per task per seq length -- PER TASK, so five tasks train on 125k samples. For
+# the QA tasks this exceeds the unique training questions (see QA_HOLDOUT), so each is
+# reused a few times with a different draw of distractor paragraphs.
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-25000}"   # samples per task per seq length
 # MUST differ from EVAL_SEED. Both were 42, which made the two prepare.py runs produce
 # identical RNG streams at the same --max_seq_length, so every eval sample at the train
@@ -112,6 +112,15 @@ TRAIN_SEED=1234
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=1000
+# QA questions reserved for evaluation. SQuAD and HotpotQA are fixed pools (~5.9k and
+# ~7.4k answerable questions), and qa.py takes questions IN ORDER from the start of the
+# pool -- the seed only reshuffles distractor paragraphs, never which questions appear.
+# Without a split, train and eval both start at question 0 and training cycles the whole
+# pool, so every eval question and its gold answer is a training target, and a model can
+# score by recalling question -> answer without reading the context. Eval takes
+# [0, QA_HOLDOUT), training takes [QA_HOLDOUT, end). The margin over EVAL_SAMPLES absorbs
+# questions skipped for not fitting the length budget.
+QA_HOLDOUT=2000
 EVAL_SEED=42                # RULER default
 
 # ====================== TRAINING =============================================
@@ -249,45 +258,28 @@ done
 
 # Task list (must match entries in synthetic.yaml)
 source "${SCRIPT_DIR}/config_tasks.sh"
-# An explicit include list, not the full synthetic[@] suite. The three kept tasks are
-# the ones whose difficulty stays constant as the context grows, which is what makes a
-# drop from 2048 to 8192 readable as a positional failure rather than a harder problem:
+# An explicit include list, not the full synthetic[@] suite: the two QA tasks and the
+# three multi-key needle tasks. Known properties worth keeping in mind when reading
+# results, since each one bears on whether a drop with length is positional:
 #
-#   niah_single_1  noise haystack is one sentence repeated, so 4x the length is 4x the
-#                  same filler and nothing about the input changes but the span.
-#   niah_single_3  essay haystack, uuid answer. The answer is a 33-chunk uuid, which is
-#                  why a bag-of-tokens model scores 0 on it while the masked arms reach
-#                  92-99: the single cleanest test of positional ability in the suite.
-#   vt             hop count is fixed at 4 whatever the length, so only the distance
-#                  between chain links grows, and insertion positions come from the
-#                  per-sample RNG, so there is no fixed-position shortcut to memorise.
-#
-# The rest are dropped because each confounds length with something else:
-#   cwe            get_example() switches freq_cw 6->30 and freq_ucw 1->3 at
-#                  max_seq_length 4096 -- exactly the train/eval boundary, so what is
-#                  evaluated is not what was trained.
-#   fwe            vocab_size = max_seq_length // 50, so the counting distribution is
-#                  rebuilt at every length. Counting is position-invariant besides,
-#                  which is near-zero signal for a positional ablation.
-#   cwe, fwe       both shuffle with random.Random(args.random_seed), re-seeded per
-#                  call, so answer tokens land at identical absolute positions in every
-#                  sample. That shortcut dies at a new length and reads as an encoding
-#                  failure when it is memorisation collapse.
-#   qa_1, qa_2     extractive SQuAD/HotpotQA from scratch floors at every length, so no
-#                  extrapolation signal, and a long hotpotqa question can blow 2048.
-#   niah_multikey_2/3   the "needle" haystack makes the distractors themselves key/value
-#                  needles, so distractor count scales with length. No arm has separated
-#                  from zero on either (best observed 0.8).
-#   niah_single_2, niah_multikey_1, niah_multivalue, niah_multiquery
-#                  essay haystack is always the corpus prefix, so eval at 8192 contains
-#                  text never seen at the 2048 training length. niah_single_3 pays that
-#                  cost too but earns it with the uuid answer; these do not.
+#   qa_1, qa_2     SQuAD / HotpotQA. Distractor paragraphs fill the context, so a longer
+#                  context means more distractors, not just more distance. They draw from
+#                  a FINITE question pool, so train and eval are kept on disjoint question
+#                  ranges -- see QA_HOLDOUT. HotpotQA carries all ten of its paragraphs,
+#                  which cannot be split, so some questions exceed 2048 outright and are
+#                  skipped (logged by qa.py).
+#   niah_multikey_1  essay haystack with 4 key/value needles; the query must pick one.
+#                  Needle count is fixed, but the essay is always the corpus prefix, so
+#                  eval at 8192 contains text never seen at the 2048 training length.
+#   niah_multikey_2/3  "needle" haystack: the filler is itself key/value needles, so
+#                  distractor count grows with length. _3 uses uuid keys and values, so
+#                  it also needs long exact copies.
 if $SANITY; then
     # Applied here, not in the sanity block above, because this line would otherwise
     # overwrite it -- config_tasks.sh is sourced after the grid is configured.
     TASKS=("${SANITY_TASKS[@]}")
 else
-    TASKS=("niah_single_1" "niah_single_3" "vt")
+    TASKS=("qa_1" "qa_2" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
 fi
 
 # Fail here rather than partway through a submission: prepare.py looks each task up in
@@ -633,7 +625,8 @@ generate_eval_data() {
                 --max_seq_length "${SEQ_LEN}" \
                 --model_template_type base \
                 --num_samples "${EVAL_SAMPLES}" \
-                --random_seed "${EVAL_SEED}"
+                --random_seed "${EVAL_SEED}" \
+                --qa_start 0 --qa_end "${QA_HOLDOUT}"
         done
     done
 }
@@ -653,7 +646,8 @@ generate_train_data() {
                 --max_seq_length "${SEQ_LEN}" \
                 --model_template_type base \
                 --num_samples "${TRAIN_SAMPLES}" \
-                --random_seed "${TRAIN_SEED}"
+                --random_seed "${TRAIN_SEED}" \
+                --qa_start "${QA_HOLDOUT}"
         done
     done
 }
@@ -854,7 +848,7 @@ set -euo pipefail
 # referencing them before they are declared aborts the job immediately.
 $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
-             EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED)
+             EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED QA_HOLDOUT)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
@@ -930,7 +924,7 @@ $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEA
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC \
-             EVAL_SEED TASKS SCRIPT_DIR)
+             EVAL_SEED QA_HOLDOUT TASKS SCRIPT_DIR)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
