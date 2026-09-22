@@ -224,13 +224,17 @@ if $SANITY; then
     LR=3e-4; WARMUP=200
     KEEP_CHECKPOINTS=true              # keep it, so a failure can be inspected
 
-    # Sinusoidal + causal: the arm most likely to work. If this cannot retrieve a
-    # needle from 512 tokens it saw in training, nothing in the grid is meaningful.
-    SANITY_SPEC="$(printf 'C%.0s' $(seq 1 "${NUM_HEADS}"))"
-    MASK_CONFIGS=("${SANITY_SPEC}")
-    NO_MASK_SPEC="$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))"
-    PE_CROSSED_WITH_MASKS=("sinusoidal")
-    PE_NO_MASK_ONLY=()
+    # ALiBi with no mask: the arm the full grid showed to be strongest -- 99+ on every
+    # task at every length, 4x extrapolation included. A positive control has to be the
+    # configuration most likely to succeed, so that failing it means the pipeline is
+    # broken rather than that a weak arm is weak. This was sinusoidal + causal, on the
+    # guess that it would be easiest; the grid refuted that (0.0 in all nine sinusoidal
+    # cells), and it scored 13.5 here once eval stopped overlapping the training data.
+    SANITY_SPEC="$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))"
+    MASK_CONFIGS=("${SANITY_SPEC}")     # validated only; no arm crosses it with a PE
+    NO_MASK_SPEC="${SANITY_SPEC}"
+    PE_CROSSED_WITH_MASKS=()
+    PE_NO_MASK_ONLY=("alibi")
 fi
 
 
@@ -247,7 +251,7 @@ fi
 
 # Flatten the grid into explicit "<pe> <mask_spec>" cells.
 EXPERIMENTS=()
-for pe in "${PE_CROSSED_WITH_MASKS[@]}"; do
+for pe in ${PE_CROSSED_WITH_MASKS[@]+"${PE_CROSSED_WITH_MASKS[@]}"}; do
     for spec in "${MASK_CONFIGS[@]}"; do
         EXPERIMENTS+=("${pe} ${spec}")
     done
