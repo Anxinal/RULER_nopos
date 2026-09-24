@@ -39,6 +39,8 @@ synthetic=(
     "niah_multivalue"
     "niah_multiquery"
     "vt"
+    "vt_4chain"
+    "vt_8chain"
     "cwe"
     "fwe"
     "qa_1"

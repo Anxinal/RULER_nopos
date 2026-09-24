@@ -99,6 +99,34 @@ vt:
     num_chains: 1
     num_hops: 4
 
+# Multi-chain variable tracking. Only the number of DISTRACTOR chains changes: the
+# query is always the root value of chain 0 and the answer is always that chain's
+# num_hops+1 variables, so the target length is identical to plain vt and the extra
+# chains add disambiguation work rather than more to copy.
+#
+# num_hops stays at 4 on purpose. It is what keeps difficulty constant as the context
+# grows -- at 8192 there are still four hops and the same chain count, only more noise
+# between the links -- which is what makes a score drop from 2048 to 8192 readable as
+# a positional failure rather than a harder problem. Raising num_chains keeps that
+# property; raising num_hops would not.
+#
+# Chain text is cheap, so neither variant crowds out the haystack: at a 2048 budget the
+# links are about 6% of the context at four chains and 12% at eight, leaving ~70 and
+# ~65 noise blocks respectively.
+vt_4chain:
+  task: variable_tracking
+  args:
+    type_haystack: noise
+    num_chains: 4
+    num_hops: 4
+
+vt_8chain:
+  task: variable_tracking
+  args:
+    type_haystack: noise
+    num_chains: 8
+    num_hops: 4
+
 cwe:
   task: common_words_extraction
   args:

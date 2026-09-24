@@ -32,7 +32,7 @@ from typing import Optional
 from .PositionalEmbeddings import build_positional_embedding
 from .transformer_encoder import TransformerEncoder
 from .transformer_decoder import TransformerDecoder
-from .masks import build_head_mask_bias, parse_mask_spec
+from .masks import build_head_mask_bias, parse_mask_spec, spec_can_empty_rows
 
 # The decoder must be able to attend only to what it has already produced.
 DECODER_MASK_TYPE = "C"
@@ -171,6 +171,7 @@ class MaskedTransformer(nn.Module):
         dtype: torch.dtype,
         key_padding_mask: Optional[torch.Tensor] = None,
         use_alibi: bool = False,
+        query_padding_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Combine attention mask, ALiBi bias and key padding into one additive tensor.
 
@@ -186,6 +187,11 @@ class MaskedTransformer(nn.Module):
             device, dtype: must match the attention query tensor.
             key_padding_mask: ``[batch, k_len]`` bool, ``True`` at padded keys.
             use_alibi: whether to fold in the ALiBi per-head bias.
+            query_padding_mask: ``[batch, q_len]`` bool, ``True`` at padded queries.
+                Self-attention only, where it is the same tensor as
+                *key_padding_mask*. Used to neutralise rows that the mask and the
+                padding would otherwise leave with nothing to attend to -- see the
+                note at the end of this method.
 
         Returns:
             Additive bias broadcastable to ``[batch, heads, q_len, k_len]``, or ``None``
@@ -226,6 +232,46 @@ class MaskedTransformer(nn.Module):
             # copy of a tensor that is 1.07 GB at [1, 8, 8192, 8192] in fp16 -- on every
             # forward pass, defeating the mask cache entirely.
             bias = bias.clamp_min(neg)
+
+        # Rows with nothing left to attend to are neutralised, not merely made finite.
+        #
+        # A future-only head keeps j >= i, so a query sitting in the padded tail of a
+        # ragged batch has every key it is allowed to see masked as padding, and its
+        # whole row collapses to `neg`. Keeping the entries finite is not enough: the
+        # memory-efficient SDPA backend -- the one chosen for a float bias of this shape
+        # on CUDA -- returns NaN for a fully masked row regardless
+        # (pytorch/pytorch#110213). That NaN lands on a padded encoder position, and the
+        # decoder's cross-attention then multiplies it by the zero weight the source
+        # padding mask produces, so `0 * NaN = NaN` carries it into every real position
+        # and the loss is NaN from that batch onward.
+        #
+        # Zeroing the row lets those queries attend everywhere, which is safe because
+        # nothing downstream reads them: no real query can attend to a padded key
+        # (`key_padding_mask` blocks the whole column), so a padded position never
+        # influences a real one, and cross-attention masks the padded encoder outputs
+        # away. The row has to contain *something* attendable, and uniform attention
+        # over the sequence is the cheapest well-defined choice.
+        #
+        # Gated on the spec so the common arms pay nothing: only "F" can empty a row,
+        # and for "B"/"C"/"S" this would also force the `[batch, 1, 1, k_len]` padding
+        # bias to expand to the full `[batch, 1, q_len, k_len]` (64 MB at batch 8 and
+        # 2048 tokens in fp16, on every forward pass) for no benefit.
+        if (
+            bias is not None
+            and query_padding_mask is not None
+            and mask_spec is not None
+            and spec_can_empty_rows(mask_spec, self.num_heads)
+        ):
+            rows = query_padding_mask.view(-1, 1, q_len, 1)
+            if n_terms > 1:
+                # The clamp above already returned a tensor owned by this call, so this
+                # writes in place rather than allocating a second [batch, heads, q_len,
+                # k_len] -- 512 MB at batch 8 and 2048 tokens in fp16, on every forward.
+                bias = bias.masked_fill_(rows, 0.0)
+            else:
+                # A lone term can be a cached mask plane shared with every other layer
+                # and every other batch, so it must never be written to in place.
+                bias = bias.masked_fill(rows, 0.0)
         return bias
 
     # ------------------------------------------------------------------
@@ -267,6 +313,8 @@ class MaskedTransformer(nn.Module):
             dtype=_compute_dtype(src_tokens.device),
             key_padding_mask=src_key_padding_mask,
             use_alibi=self.pe.pe_type == "alibi",
+            # Self-attention, so the queries are the same tokens as the keys.
+            query_padding_mask=src_key_padding_mask,
         )
         return self.encoder(x, attn_bias=attn_bias, pe=self.pe)
 

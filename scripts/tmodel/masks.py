@@ -1,4 +1,6 @@
 
+import math
+
 import torch
 from abc import ABC, abstractmethod
 
@@ -8,15 +10,41 @@ def fill_with_neg_inf(t: torch.Tensor) -> torch.Tensor:
     return t.fill_(float("-inf"))
 
 
+# Defaults for the soft causal mask ("S"). Defined here as the single source of truth:
+# train.py's argparse defaults and model_wrappers.py's checkpoint fallbacks both import
+# these, so the value used at training and the value used at evaluation cannot drift.
+# That matters more than usual here -- the mask is neither a parameter nor a buffer, so
+# load_state_dict cannot detect a mismatch and a wrong cap would be evaluated silently.
+#
+# cap is in units of the ALREADY-SCALED attention logits: SDPA computes
+# softmax(QK^T / sqrt(head_dim) + attn_mask), so the bias lands after the scaling, the
+# same as the ALiBi bias in PositionalEmbeddings.py. A fully penalised future key gets
+# exp(-cap) of the softmax weight an equal unpenalised past key gets, so total far-future
+# mass is bounded by n_keys * exp(-cap). At cap=12 that is 1.3% over 2048 keys and 5.0%
+# over 8192 -- chosen for the longest EVALUATION length rather than the training length,
+# since a cap tuned at 2048 would leak four times as much at the top of the eval ladder
+# and the mask would itself become a length-generalisation failure. It also sits ~5000x
+# below fp16's 65504, so the cast in build_additive_mask is never near its range.
+SOFT_MASK_CAP_DEFAULT = 12.0
+# tau is an absolute token count, never a fraction of the sequence length: the bias
+# depends only on the offset j - i, which is what makes it identical at 2048 and 8192.
+# At cap=12 the near-diagonal slope is cap/tau = 0.19 logits per token, inside the range
+# of ALiBi's eight-head schedule (0.5 ... 0.0039) already used in this repo.
+SOFT_MASK_TAU_DEFAULT = 64.0
+
+
 
 
 class Mask(ABC):
     """Base class for a square additive attention mask.
 
-    Subclasses implement ``_build`` to return a ``[dim, dim]`` float tensor
-    where masked positions hold ``-inf`` and unmasked positions hold ``0``.
-    ``apply`` adds the mask to an attention-weight tensor in place of the
-    standard ``attn_weights += attn_mask`` pattern used throughout fairseq.
+    Subclasses implement ``_build`` to return a ``[dim, dim]`` float tensor that is added
+    to the attention logits: ``0`` leaves a position untouched and a negative entry
+    down-weights it. The hard masks use only ``0`` and ``-inf``, but an entry may be any
+    finite negative value -- :class:`SoftCausalMask` grades its penalty with distance --
+    so do not assume the tensor is two-valued. ``apply`` adds the mask to an
+    attention-weight tensor in place of the standard ``attn_weights += attn_mask``
+    pattern used throughout fairseq.
     """
 
     def __init__(self, dim: int):
@@ -27,7 +55,10 @@ class Mask(ABC):
 
     @property
     def tensor(self) -> torch.Tensor:
-        """The raw ``[dim, dim]`` mask tensor (0 = attend, -inf = block)."""
+        """The raw ``[dim, dim]`` additive mask tensor.
+
+        ``0`` = attend unpenalised, negative = down-weighted, ``-inf`` = blocked.
+        """
         return self._mask
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
@@ -38,15 +69,31 @@ class Mask(ABC):
     def convert_from_config(cls, config: str):
         """Return the Mask **subclass** for a one-letter config code.
 
-        ``"C"`` → CausalMask, ``"F"`` → FutureOnlyMask, anything else →
-        BidirectionalMask.  The caller is responsible for instantiating the
-        returned class with the appropriate ``dim``.
+        ``"B"`` → BidirectionalMask, ``"C"`` → CausalMask, ``"F"`` → FutureOnlyMask,
+        ``"S"`` → SoftCausalMask. The caller is responsible for instantiating the
+        returned class; note ``SoftCausalMask`` takes ``cap``/``tau`` beyond ``dim``.
+
+        Raises:
+            ValueError: on an unrecognised code.
+
+        This used to fall through to ``BidirectionalMask`` for anything unknown, which
+        meant a code added to :data:`VALID_MASK_CODES` but forgotten here would silently
+        train a *bidirectional* model while reporting the new code in its config -- a
+        null result indistinguishable from a real one. Raising is safe: the only caller
+        is :func:`build_additive_mask`, reached after ``parse_mask_spec`` has already
+        validated the code, so this can only fire on a direct call.
         """
-        if config == "C":
+        if config == "B":
+            return BidirectionalMask
+        elif config == "C":
             return CausalMask
         elif config == "F":
             return FutureOnlyMask
-        return BidirectionalMask
+        elif config == "S":
+            return SoftCausalMask
+        raise ValueError(
+            f"Unknown mask code {config!r}; valid codes are {'/'.join(VALID_MASK_CODES)}."
+        )
 
 class CausalMask(Mask):
     """Standard autoregressive (causal) mask.
@@ -105,6 +152,79 @@ class BidirectionalMask(Mask):
         return torch.zeros(dim, dim)
 
 
+class SoftCausalMask(Mask):
+    """Causal mask with a graded, bounded penalty instead of a hard block.
+
+    The past is free and the future is discouraged by an amount that grows with distance
+    and saturates. For query ``i`` and key ``j``, with ``d = j - i``:
+
+    * ``j < i``  (past):            bias ``0``
+    * ``j >= i`` (present/future):  bias ``-cap * tanh(d / tau)``
+
+    ``f(0) = 0``, so the diagonal is never penalised and self-attention is always free;
+    ``f`` is strictly increasing in ``d`` and bounded above by ``cap``. A single ``f`` is
+    shared by every head, unlike ALiBi's per-head slope schedule.
+
+    This gives a continuous knob between the two hard masks that none of ``B``/``C``/``F``
+    provides: ``cap = 0`` is exactly bidirectional, and a large ``cap`` approaches causal.
+
+    Example (dim=4, cap=12, tau=2, rounded):
+        [  0.00  -5.57  -9.17 -11.07 ]
+        [  0.00   0.00  -5.57  -9.17 ]
+        [  0.00   0.00   0.00  -5.57 ]
+        [  0.00   0.00   0.00   0.00 ]
+
+    Args:
+        dim: sequence length (mask will be ``[dim, dim]``).
+        cap: upper bound on the penalty, in units of the **already-scaled** attention
+            logits -- SDPA applies ``1 / sqrt(head_dim)`` itself, so this bias is added
+            after that scaling. A fully penalised future key receives ``exp(-cap)`` of
+            the softmax weight an equal unpenalised past key receives.
+        tau: distance scale, an absolute token count. ``tanh`` reaches 0.76 of ``cap`` at
+            ``d = tau`` and 0.995 at ``d = 3 * tau``; near the diagonal the penalty grows
+            at ``cap / tau`` logits per token.
+
+    Raises:
+        ValueError: on a non-positive ``tau`` (which would make ``0 / 0`` a NaN on the
+            diagonal, surfacing only as a NaN loss much later), a negative ``cap`` (which
+            would *reward* the future), or a non-finite/absurd ``cap``.
+    """
+
+    def __init__(self, dim: int,
+                 cap: float = SOFT_MASK_CAP_DEFAULT,
+                 tau: float = SOFT_MASK_TAU_DEFAULT):
+        cap = float(cap)
+        tau = float(tau)
+        if not math.isfinite(tau) or tau <= 0.0:
+            raise ValueError(
+                f"SoftCausalMask: tau must be finite and strictly positive, got {tau!r}. "
+                f"tau=0 would make d/tau a NaN on the diagonal."
+            )
+        if not math.isfinite(cap) or cap < 0.0:
+            raise ValueError(
+                f"SoftCausalMask: cap must be finite and non-negative, got {cap!r}. "
+                f"A negative cap would reward attending to the future; use cap=0 for a "
+                f"bidirectional mask."
+            )
+        if cap > 1e4:
+            raise ValueError(
+                f"SoftCausalMask: cap={cap!r} is far beyond anything meaningful -- "
+                f"exp(-100) already underflows float32, so the mask is indistinguishable "
+                f"from hard causal well below this, and fp16 saturates at 65504."
+            )
+        self.cap = cap
+        self.tau = tau
+        super().__init__(dim)  # must come last: the base ctor calls _build immediately
+
+    def _build(self, dim: int) -> torch.Tensor:
+        pos = torch.arange(dim)
+        # j - i, floored at 0 so the past half-plane and the diagonal are both exactly
+        # zero in one step (d=0 -> tanh(0) = 0). Branch-free, so f(0)=0, strict
+        # monotonicity and boundedness all follow from the closed form.
+        d = (pos.unsqueeze(0) - pos.unsqueeze(1)).clamp_min(0).to(torch.float32)
+        return -self.cap * torch.tanh(d / self.tau)
+
+
 # ---------------------------------------------------------------------------
 # Cached additive masks
 # ---------------------------------------------------------------------------
@@ -112,7 +232,9 @@ class BidirectionalMask(Mask):
 _MASK_CACHE = {}
 
 
-def build_additive_mask(mask_type: str, dim: int, device, dtype) -> torch.Tensor:
+def build_additive_mask(mask_type: str, dim: int, device, dtype, *,
+                        soft_cap: float = SOFT_MASK_CAP_DEFAULT,
+                        soft_tau: float = SOFT_MASK_TAU_DEFAULT) -> torch.Tensor:
     """Return a cached ``[dim, dim]`` additive mask, or ``None`` for bidirectional.
 
     Two differences from instantiating a :class:`Mask` directly, both of which matter
@@ -128,26 +250,47 @@ def build_additive_mask(mask_type: str, dim: int, device, dtype) -> torch.Tensor
       decoder's cross-attention multiplies it by a zero weight, and ``0 * NaN`` is NaN,
       so it would propagate into real positions. Finite values soften such a row to a
       uniform distribution instead, and its output is discarded downstream anyway.
+      ``"S"`` never needs this: its penalty is bounded by ``soft_cap``, so no row can be
+      fully masked and the post-processing below is a no-op on it.
 
     Args:
-        mask_type: ``"B"`` bidirectional, ``"C"`` causal, ``"F"`` future-only.
+        mask_type: ``"B"`` bidirectional, ``"C"`` causal, ``"F"`` future-only,
+                   ``"S"`` soft causal (graded finite penalty on the future).
         dim:       sequence length.
         device:    target device.
         dtype:     target floating dtype (must match the attention query dtype).
+        soft_cap:  ``"S"`` only -- penalty ceiling, in already-scaled logit units.
+        soft_tau:  ``"S"`` only -- distance scale in tokens. See :class:`SoftCausalMask`.
 
     Returns:
         ``[dim, dim]`` additive mask, or ``None`` when ``mask_type`` is ``"B"``.
+        Note ``"S"`` never returns ``None``, even at ``soft_cap == 0``; callers that want
+        that degeneracy rewrite the code to ``"B"`` instead (see
+        :func:`build_head_mask_bias`), because the homogeneous path there dereferences
+        the returned plane without a ``None`` check.
     """
     if mask_type == "B":
         return None  # bidirectional: nothing to add
 
+    # The soft mask's parameters are part of its identity, so two models differing only
+    # in cap or tau must not share a cached plane. They are appended only for "S" so that
+    # every existing key stays byte-identical -- which preserves the property documented
+    # in build_head_mask_bias that the decoder's causal plane is literally the same object
+    # as the encoder's, even when the encoder is sweeping a non-default cap.
     key = (mask_type, dim, str(device), dtype)
+    if mask_type == "S":
+        key += (float(soft_cap), float(soft_tau))
     cached = _MASK_CACHE.get(key)
     if cached is not None:
         return cached
 
     mask_cls = Mask.convert_from_config(mask_type)
-    tensor = mask_cls(dim).tensor  # float32, -inf in masked positions
+    # convert_from_config returns a class, which is what every other branch wants; only
+    # the soft mask needs constructor arguments beyond dim.
+    if mask_type == "S":
+        tensor = mask_cls(dim, cap=soft_cap, tau=soft_tau).tensor
+    else:
+        tensor = mask_cls(dim).tensor  # float32, -inf in masked positions
     neg = torch.finfo(dtype).min
     tensor = torch.nan_to_num(tensor, neginf=neg).to(device=device, dtype=dtype)
     tensor = tensor.clamp_min(neg)
@@ -166,7 +309,42 @@ def clear_mask_cache() -> None:
 # Per-head mask specs
 # ---------------------------------------------------------------------------
 
-VALID_MASK_CODES = ("B", "C", "F")
+VALID_MASK_CODES = ("B", "C", "F", "S")
+
+# Codes whose mask can leave a query row with no attendable key at all, once the key
+# padding mask is folded in on top of it.
+#
+# Only "F" can. A future-only head at query i keeps j >= i, so for a query sitting in
+# the padded tail of a ragged batch every key it is allowed to see is padding, and the
+# combined bias for that row is uniformly -inf/neg. "C" and "B" cannot: whatever the
+# padding, a causal or bidirectional row always retains at least one real key at j <= i
+# (position 0 is never padding, since padding is a right-hand tail). "S" cannot either,
+# because its penalty is bounded by soft_cap and never blocks anything outright.
+#
+# A fully masked row is not merely meaningless, it is a NaN source: the memory-efficient
+# SDPA backend returns NaN for such rows even when the mask is the dtype minimum rather
+# than -inf (pytorch/pytorch#110213 -- the reason transformers carries
+# AttentionMaskConverter._unmask_unattended). The NaN then leaves the encoder at a padded
+# position and reaches every real position through the decoder's cross-attention, where
+# the padded key is multiplied by a zero weight and 0 * NaN = NaN.
+#
+# MaskedTransformer._build_attn_bias consults this to decide whether the rows belonging
+# to padded queries need neutralising. See the note there.
+EMPTY_ROW_CODES = ("F",)
+
+
+def spec_can_empty_rows(spec: str, num_heads: int) -> bool:
+    """Whether *spec* can produce a query row with nothing left to attend to.
+
+    True only when the spec contains a code from :data:`EMPTY_ROW_CODES`, and only
+    relevant for a batch that actually carries key padding -- without padding, every
+    code including ``"F"`` keeps at least the diagonal.
+
+    Args:
+        spec:      per-head mask spec, e.g. ``"CCCCFFFF"``.
+        num_heads: number of attention heads (for expanding a single-code spec).
+    """
+    return any(code in EMPTY_ROW_CODES for code in parse_mask_spec(spec, num_heads))
 
 _HEAD_MASK_CACHE = {}
 
@@ -215,7 +393,9 @@ def parse_mask_spec(spec: str, num_heads: int) -> list:
     return list(cleaned)
 
 
-def build_head_mask_bias(spec: str, num_heads: int, dim: int, device, dtype):
+def build_head_mask_bias(spec: str, num_heads: int, dim: int, device, dtype, *,
+                         soft_cap: float = SOFT_MASK_CAP_DEFAULT,
+                         soft_tau: float = SOFT_MASK_TAU_DEFAULT):
     """Return the additive mask for a per-head spec, cached and reused.
 
     Three cases, in increasing cost:
@@ -237,15 +417,27 @@ def build_head_mask_bias(spec: str, num_heads: int, dim: int, device, dtype):
     """
     codes = parse_mask_spec(spec, num_heads)
 
+    # A soft mask with a zero cap is exactly bidirectional, so rewrite it as one. Doing
+    # this here rather than returning None from build_additive_mask is deliberate: the
+    # homogeneous branch below dereferences the returned plane with .view() and has no
+    # None guard, so a plain "SSSSSSSS" spec would raise AttributeError. Rewriting keeps
+    # the invariant that build_additive_mask returns None only for "B", and lets the
+    # all-B early return handle the degenerate case for free.
+    if soft_cap == 0.0:
+        codes = ["B" if code == "S" else code for code in codes]
+
     if all(code == "B" for code in codes):
         return None
 
     if len(set(codes)) == 1:
         # Homogeneous: broadcast the shared plane across heads instead of copying it.
-        plane = build_additive_mask(codes[0], dim, device, dtype)
+        plane = build_additive_mask(codes[0], dim, device, dtype,
+                                    soft_cap=soft_cap, soft_tau=soft_tau)
         return plane.view(1, 1, dim, dim)
 
     key = (tuple(codes), dim, str(device), dtype)
+    if "S" in codes:
+        key += (float(soft_cap), float(soft_tau))
     cached = _HEAD_MASK_CACHE.get(key)
     if cached is not None:
         return cached
@@ -253,7 +445,8 @@ def build_head_mask_bias(spec: str, num_heads: int, dim: int, device, dtype):
     zeros = None
     planes = []
     for code in codes:
-        plane = build_additive_mask(code, dim, device, dtype)
+        plane = build_additive_mask(code, dim, device, dtype,
+                                    soft_cap=soft_cap, soft_tau=soft_tau)
         if plane is None:  # bidirectional head: contributes nothing
             if zeros is None:
                 zeros = torch.zeros(dim, dim, device=device, dtype=dtype)

@@ -29,6 +29,7 @@ Dependencies: torch, transformers   (+ datasets for --data_format text)
 """
 
 import argparse
+import collections
 import functools
 import glob
 import json
@@ -87,8 +88,12 @@ class RulerDataset(Dataset):
         self.samples = []
 
         n_missing_prefix = 0
+        per_task = collections.Counter()
         pattern = os.path.join(data_dir, "**", "*.jsonl")
         for fpath in sorted(glob.glob(pattern, recursive=True)):
+            # prepare.py writes <save_dir>/<task>/<subset>.jsonl, so the parent
+            # directory names the task.
+            task = os.path.basename(os.path.dirname(fpath))
             with open(fpath, encoding="utf-8") as f:
                 for line in f:
                     item = json.loads(line)
@@ -99,8 +104,15 @@ class RulerDataset(Dataset):
                             n_missing_prefix += 1
                         prompt, answer = self._build_pair(item["input"] + prefix, outputs)
                         self.samples.append((prompt, answer))
+                        per_task[task] += 1
 
         log.info("RulerDataset: loaded %d samples from %s", len(self.samples), data_dir)
+        # Per task, not just the total. This glob is recursive over the whole data root,
+        # so a task dropped from the suite keeps being trained on until its directory is
+        # deleted -- the files are still there and still match. Naming each task and its
+        # count makes that visible in the first ten lines of the log instead of never.
+        for task, n in sorted(per_task.items()):
+            log.info("  %-20s %7d samples", task, n)
         if n_missing_prefix:
             log.warning(
                 "RulerDataset: %d samples had no answer_prefix field; those prompts will "
@@ -258,6 +270,18 @@ def cosine_with_warmup(optimizer, warmup: int, total: int, min_frac: float = 0.0
 # Training & evaluation loops
 # ------------------------------------------------------------------
 
+# A batch loss this far above the uniform baseline ln(vocab_size) ~= 10.8 is not a hard
+# example, it is a blow-up: even a model that has learned nothing scores ln(V), and only
+# confident wrongness with large logits gets past this. Reported per epoch so a spike is
+# visible as a spike, rather than reaching the log only as a raised epoch average.
+LOSS_SPIKE_FACTOR = 3.0
+
+# How many recent batches the windowed loss averages over. The epoch average alone is a
+# cumulative mean over thousands of batches: by mid-epoch it barely moves, so a recovery
+# is invisible and one catastrophic batch keeps it pinned high for the rest of the epoch.
+RECENT_WINDOW = 200
+
+
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
               scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
               accum_steps=1):
@@ -267,6 +291,17 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
     effective batch size is ``batch_size * accum_steps`` at the memory cost of one
     batch. The learning-rate scheduler advances once per optimizer step, not once
     per batch.
+
+    Returns:
+        ``(mean_loss, stats)`` where *mean_loss* is the token-weighted mean over the
+        finite batches and *stats* carries what the mean hides: the count of non-finite
+        and spiking batches, the worst batch loss, and the last windowed mean. The
+        caller logs these; a NaN batch that is silently averaged in is what turned a
+        recoverable blip into an unreadable run.
+
+    Raises:
+        RuntimeError: if every batch was non-finite, which would otherwise return a
+            vacuous 0.0 and read as a perfect epoch.
     """
     is_train = optimizer is not None
     model.train(is_train)
@@ -274,6 +309,12 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
     total_tokens = 0
     use_amp = scaler is not None
     n_batches = len(loader)
+    spike_threshold = LOSS_SPIKE_FACTOR * math.log(vocab_size)
+
+    recent = collections.deque(maxlen=RECENT_WINDOW)   # (loss, n_tok) per finite batch
+    stats = dict(n_nonfinite=0, n_spikes=0, max_loss=float("-inf"),
+                 first_nonfinite_step=None, last_grad_norm=float("nan"))
+    grad_norm = float("nan")
 
     if is_train:
         optimizer.zero_grad(set_to_none=True)
@@ -290,8 +331,41 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
             loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
 
         n_tok = (tgt_out != criterion.ignore_index).sum().item()
-        total_loss += loss.item() * n_tok
+        loss_val = loss.item()
+
+        # A non-finite batch is dropped, not averaged in. `total_loss` is a running sum,
+        # so a single NaN makes every later log line, the epoch loss and the val loss NaN
+        # for good -- and a NaN val loss never satisfies `val_loss < best_val`, so the run
+        # goes on to finish without ever writing best.pt and the whole cell is lost.
+        # Backward is skipped too: the gradients would be NaN throughout, and with AMP the
+        # scaler would discard the entire accumulation group, including the batches either
+        # side of this one that were perfectly fine.
+        if not math.isfinite(loss_val):
+            stats["n_nonfinite"] += 1
+            if stats["first_nonfinite_step"] is None:
+                stats["first_nonfinite_step"] = step
+            if stats["n_nonfinite"] <= 5:
+                pad_frac = src.eq(model.pad_token_id).float().mean().item()
+                log.warning(
+                    "  step %d: non-finite loss (%s), batch skipped. "
+                    "src %s (%.0f%% padding), tgt %s, logits finite=%s",
+                    step, loss_val, tuple(src.shape), 100 * pad_frac, tuple(tgt.shape),
+                    bool(torch.isfinite(logits).all()),
+                )
+            del logits, loss
+            continue
+
+        total_loss += loss_val * n_tok
         total_tokens += n_tok
+        recent.append((loss_val, n_tok))
+        if loss_val > stats["max_loss"]:
+            stats["max_loss"] = loss_val
+        if loss_val > spike_threshold:
+            stats["n_spikes"] += 1
+            if stats["n_spikes"] <= 5:
+                log.warning("  step %d: loss %.1f is %.0fx the uniform baseline %.2f",
+                            step, loss_val, loss_val / math.log(vocab_size),
+                            math.log(vocab_size))
 
         if is_train:
             # Scale down so accumulated gradients average rather than sum.
@@ -305,24 +379,43 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
             if step % accum_steps == 0 or is_last_batch:
                 if scaler:
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
+                grad_norm = float(grad_norm)
+                stats["last_grad_norm"] = grad_norm
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler:
                     scheduler.step()
 
             if step % log_every == 0:
                 avg = total_loss / max(total_tokens, 1)
-                ppl = math.exp(min(avg, 20))
+                # The windowed mean is what says whether the model is learning NOW. The
+                # cumulative one is kept beside it because it is what the epoch summary
+                # and early stopping use, and seeing the two diverge is the signal that
+                # something early in the epoch is still dominating the average.
+                win_tok = sum(t for _, t in recent)
+                win = sum(l * t for l, t in recent) / max(win_tok, 1)
                 cur_lr = scheduler.get_last_lr()[0] if scheduler else lr
-                log.info("  step %5d/%d | loss %.4f | ppl %7.1f | lr %.2e",
-                         step, n_batches, avg, ppl, cur_lr)
+                log.info(
+                    "  step %5d/%d | loss %.4f (last %d: %.4f) | ppl %7.1f | "
+                    "gnorm %.2f | lr %.2e%s",
+                    step, n_batches, avg, len(recent), win, math.exp(min(win, 20)),
+                    grad_norm, cur_lr,
+                    f" | SKIPPED {stats['n_nonfinite']} non-finite" if stats["n_nonfinite"] else "",
+                )
 
-    return total_loss / max(total_tokens, 1)
+    if total_tokens == 0:
+        raise RuntimeError(
+            f"every one of the {n_batches} batches in this epoch produced a non-finite "
+            f"loss; there is nothing to average and training cannot continue."
+        )
+    stats["recent_loss"] = (sum(l * t for l, t in recent)
+                            / max(sum(t for _, t in recent), 1))
+    return total_loss / max(total_tokens, 1), stats
 
 
 # ------------------------------------------------------------------
@@ -496,19 +589,34 @@ def main(args):
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss = run_epoch(model, train_loader, criterion, vocab_size, device,
-                               optimizer=optimizer, scheduler=scheduler,
-                               scaler=scaler if use_amp else None,
-                               grad_clip=args.grad_clip, log_every=args.log_every,
-                               lr=args.lr, accum_steps=args.grad_accum)
+        train_loss, train_stats = run_epoch(
+            model, train_loader, criterion, vocab_size, device,
+            optimizer=optimizer, scheduler=scheduler,
+            scaler=scaler if use_amp else None,
+            grad_clip=args.grad_clip, log_every=args.log_every,
+            lr=args.lr, accum_steps=args.grad_accum)
         with torch.no_grad():
-            val_loss = run_epoch(model, val_loader, criterion, vocab_size, device)
+            val_loss, val_stats = run_epoch(model, val_loader, criterion,
+                                            vocab_size, device)
         elapsed = time.time() - t0
 
         train_ppl = math.exp(min(train_loss, 20))
         val_ppl = math.exp(min(val_loss, 20))
         log.info("Epoch %d/%d | train %.4f (ppl %.1f) | val %.4f (ppl %.1f) | %.0fs",
                  epoch, args.epochs, train_loss, train_ppl, val_loss, val_ppl, elapsed)
+        # The epoch mean is a mean: it cannot distinguish a model sitting at loss 38
+        # from one training normally at 3 with a handful of catastrophic batches early
+        # on, and those call for opposite responses. Print what separates them.
+        log.info("  train: last %d batches %.4f | worst batch %.1f | %d spike(s) | "
+                 "%d non-finite batch(es) skipped%s",
+                 RECENT_WINDOW, train_stats["recent_loss"], train_stats["max_loss"],
+                 train_stats["n_spikes"], train_stats["n_nonfinite"],
+                 f" (first at step {train_stats['first_nonfinite_step']})"
+                 if train_stats["n_nonfinite"] else "")
+        if val_stats["n_nonfinite"]:
+            log.warning("  val: %d non-finite batch(es) excluded from val_loss; the "
+                        "checkpoint decision below is made on the rest",
+                        val_stats["n_nonfinite"])
 
         # Checkpoint. Weights only by default: the optimizer state is roughly twice
         # the size of the weights again, and nothing reads it back -- there is no
@@ -526,6 +634,14 @@ def main(args):
         #   * has training stopped making progress?   -> improvement must beat min_delta,
         #                                                so noise does not reset patience
         prev_best = best_val
+        # Belt and braces. run_epoch already drops non-finite batches, so val_loss
+        # should be finite; if it is not, say so, because `NaN < best_val` is False and
+        # the run would otherwise sail on to completion having never written best.pt --
+        # a silent total loss of the cell, discovered only when prediction cannot find
+        # a checkpoint to load.
+        if not math.isfinite(val_loss):
+            log.error("  val_loss is %s; no checkpoint can be selected this epoch",
+                      val_loss)
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch
@@ -540,7 +656,12 @@ def main(args):
         with open(metrics_path, "a") as f:
             f.write(json.dumps(dict(epoch=epoch, train_loss=train_loss,
                                     train_ppl=train_ppl, val_loss=val_loss,
-                                    val_ppl=val_ppl, stale=stale)) + "\n")
+                                    val_ppl=val_ppl, stale=stale,
+                                    train_recent_loss=train_stats["recent_loss"],
+                                    train_max_batch_loss=train_stats["max_loss"],
+                                    train_spikes=train_stats["n_spikes"],
+                                    train_nonfinite=train_stats["n_nonfinite"],
+                                    val_nonfinite=val_stats["n_nonfinite"])) + "\n")
 
         if args.early_stop_patience > 0 and stale >= args.early_stop_patience:
             # The floor exists because "flat" does not always mean "finished". An arm
@@ -560,6 +681,12 @@ def main(args):
     last_lr = scheduler.get_last_lr()[0] if scheduler else args.lr
     log.info("Done (%s). Best val_loss=%.4f at epoch %d/%d  Saved to %s",
              stop_reason, best_val, best_epoch, args.epochs, args.output_dir)
+    if best_epoch == 0:
+        raise RuntimeError(
+            "no checkpoint was ever written: val loss never improved on its initial "
+            "value of +inf, which means every epoch's val loss was non-finite. "
+            "Prediction would fail later with a missing best.pt; failing here instead."
+        )
     # A marker that training RAN TO COMPLETION, as opposed to a checkpoint merely
     # existing. best.pt is rewritten at every improvement, so a job killed mid-training
     # leaves one behind too -- and reusing that to skip training would silently evaluate

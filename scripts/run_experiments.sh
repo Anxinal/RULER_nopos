@@ -112,14 +112,18 @@ TRAIN_SEED=1234
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=1000
-# QA questions reserved for evaluation. SQuAD and HotpotQA are fixed pools (~5.9k and
-# ~7.4k answerable questions), and qa.py takes questions IN ORDER from the start of the
-# pool -- the seed only reshuffles distractor paragraphs, never which questions appear.
-# Without a split, train and eval both start at question 0 and training cycles the whole
-# pool, so every eval question and its gold answer is a training target, and a model can
-# score by recalling question -> answer without reading the context. Eval takes
-# [0, QA_HOLDOUT), training takes [QA_HOLDOUT, end). The margin over EVAL_SAMPLES absorbs
-# questions skipped for not fitting the length budget.
+# QA questions reserved for evaluation. DORMANT while no qa_* task is in TASKS: the
+# --qa_start/--qa_end flags below are still passed to prepare.py, which forwards them
+# only for tasks whose generator is qa.py, so they are a no-op for the current suite.
+# Kept because the split is a correctness requirement, not a tuning knob, the moment a
+# QA task comes back: SQuAD and HotpotQA are fixed pools (~5.9k and ~7.4k answerable
+# questions), and qa.py takes questions IN ORDER from the start of the pool -- the seed
+# only reshuffles distractor paragraphs, never which questions appear. Without a split,
+# train and eval both start at question 0 and training cycles the whole pool, so every
+# eval question and its gold answer is a training target, and a model can score by
+# recalling question -> answer without reading the context. Eval takes [0, QA_HOLDOUT),
+# training takes [QA_HOLDOUT, end). The margin over EVAL_SAMPLES absorbs questions
+# skipped for not fitting the length budget.
 QA_HOLDOUT=2000
 EVAL_SEED=42                # RULER default
 
@@ -262,29 +266,64 @@ done
 
 # Task list (must match entries in synthetic.yaml)
 source "${SCRIPT_DIR}/config_tasks.sh"
-# An explicit include list, not the full synthetic[@] suite: the two QA tasks and the
-# three multi-key needle tasks. Known properties worth keeping in mind when reading
-# results, since each one bears on whether a drop with length is positional:
+# An explicit include list, not the full synthetic[@] suite: two multi-chain variable
+# tracking tasks and the three multi-key needle tasks, of which four are trained on and
+# one (vt_8chain) is held out for evaluation only -- see the split below. Known
+# properties worth keeping in mind when reading results, since each one bears on whether
+# a drop with length is positional:
 #
-#   qa_1, qa_2     SQuAD / HotpotQA. Distractor paragraphs fill the context, so a longer
-#                  context means more distractors, not just more distance. They draw from
-#                  a FINITE question pool, so train and eval are kept on disjoint question
-#                  ranges -- see QA_HOLDOUT. HotpotQA carries all ten of its paragraphs,
-#                  which cannot be split, so some questions exceed 2048 outright and are
-#                  skipped (logged by qa.py).
+#   vt_4chain, vt_8chain  four and eight assignment chains in a noise haystack, four
+#                  hops each. Both counts are fixed, so 4x the context is 4x the
+#                  distance between links and nothing else -- the property that makes a
+#                  2048 -> 8192 drop readable as positional. The noise haystack is one
+#                  sentence repeated, so samples come out near-uniform in length and
+#                  batches are barely ragged. The answer is a set of five variable
+#                  names, which resists the answer-prior basin better than a single
+#                  number does.
 #   niah_multikey_1  essay haystack with 4 key/value needles; the query must pick one.
 #                  Needle count is fixed, but the essay is always the corpus prefix, so
 #                  eval at 8192 contains text never seen at the 2048 training length.
 #   niah_multikey_2/3  "needle" haystack: the filler is itself key/value needles, so
 #                  distractor count grows with length. _3 uses uuid keys and values, so
 #                  it also needs long exact copies.
+#
+# qa_1/qa_2 were here and were dropped. Extractive QA draws from a finite question pool
+# (SQuAD ~5.9k answerable, HotpotQA ~7.4k), so 25k samples per task reuse each question
+# several times, and a longer context means more distractor paragraphs rather than more
+# distance -- so a drop with length is not cleanly positional. They are also the only
+# tasks whose sample lengths vary by hundreds of tokens, because qa.py shrinks the
+# haystack per question until it fits; that makes every batch ragged with padding.
+#
+# The task list is split the same way the sequence lengths are. TRAIN_TASKS is what the
+# model sees; EVAL_ONLY_TASKS is held out entirely and scored but never trained on, which
+# gives a second generalisation axis orthogonal to length:
+#
+#                        2048 (train len)   4096   8192
+#   vt_4chain (trained)  in-distribution    len    len
+#   vt_8chain (held out) distractors        both   both
+#
+# vt_8chain differs from vt_4chain only in the number of distractor chains -- same hop
+# count, same noise haystack, same five-variable answer, same template -- so a drop from
+# the first row to the second isolates distractor count the way a drop across a row
+# isolates length. It costs no training time, only the eval data and the prediction pass.
+#
+# Every training task is also an evaluation task, so TASKS below is the union and is
+# exactly what gets scored. Only generate_train_data reads TRAIN_TASKS.
 if $SANITY; then
     # Applied here, not in the sanity block above, because this line would otherwise
-    # overwrite it -- config_tasks.sh is sourced after the grid is configured.
-    TASKS=("${SANITY_TASKS[@]}")
+    # overwrite it -- config_tasks.sh is sourced after the grid is configured. The
+    # positive control trains and evaluates on the same single task: it exists to prove
+    # the pipeline can learn at all, so holding anything out would only add a way for it
+    # to fail that says nothing about the pipeline.
+    TRAIN_TASKS=("${SANITY_TASKS[@]}")
+    EVAL_ONLY_TASKS=()
 else
-    TASKS=("qa_1" "qa_2" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
+    TRAIN_TASKS=("vt_4chain" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
+    EVAL_ONLY_TASKS=("vt_8chain")
 fi
+# `${arr[@]+...}` because 'set -u' aborts on an empty array expansion in older bash,
+# and EVAL_ONLY_TASKS is empty in sanity mode.
+TASKS=("${TRAIN_TASKS[@]}" ${EVAL_ONLY_TASKS[@]+"${EVAL_ONLY_TASKS[@]}"})
 
 # Fail here rather than partway through a submission: prepare.py looks each task up in
 # synthetic.yaml, and a typo would otherwise surface one task into data generation.
@@ -294,7 +333,17 @@ for _t in "${TASKS[@]}"; do
         exit 1
     fi
 done
-echo "Tasks: ${#TASKS[@]} (${TASKS[*]})"
+# A held-out task that is silently also trained on is the one mistake this split can
+# make, and it would look like a strong generalisation result rather than an error.
+for _t in ${EVAL_ONLY_TASKS[@]+"${EVAL_ONLY_TASKS[@]}"}; do
+    case " ${TRAIN_TASKS[*]} " in
+        *" ${_t} "*)
+            echo "ERROR: '${_t}' is in both TRAIN_TASKS and EVAL_ONLY_TASKS." >&2
+            exit 1 ;;
+    esac
+done
+echo "Tasks: ${#TASKS[@]} total | train ${#TRAIN_TASKS[@]} (${TRAIN_TASKS[*]})"
+echo "       held out for eval only: ${EVAL_ONLY_TASKS[*]:-none}"
 
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
@@ -640,7 +689,10 @@ generate_train_data() {
     for SEQ_LEN in "${TRAIN_SEQ_LENGTHS[@]}"; do
         DATA_DIR="${TRAIN_DATA_DIR}/${SEQ_LEN}/data"
         mkdir -p "${DATA_DIR}"
-        for TASK in "${TASKS[@]}"; do
+        # TRAIN_TASKS, not TASKS. train.py globs this whole tree recursively, so a
+        # held-out task generated here would be trained on no matter what the task
+        # list says.
+        for TASK in "${TRAIN_TASKS[@]}"; do
             python "${SCRIPT_DIR}/data/prepare.py" \
                 --save_dir   "${DATA_DIR}" \
                 --benchmark  synthetic \
@@ -850,7 +902,7 @@ if ! $LOCAL && ! $DRY_RUN; then
 set -euo pipefail
 # Variables first: setup_env reads VENV_DIR and friends, and under 'set -u'
 # referencing them before they are declared aborts the job immediately.
-$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS \
+$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS TRAIN_TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED QA_HOLDOUT)
 $(declare -f setup_env)
