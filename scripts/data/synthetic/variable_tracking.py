@@ -92,12 +92,45 @@ DEPTHS = list(np.round(np.linspace(0, 100, num=40, endpoint=True)).astype(int))
 
 def generate_chains(num_chains, num_hops, is_icl=False):
 
-    vars_all = []
     k = 5 if not is_icl else 3
     num_hops = num_hops if not is_icl else min(10, num_hops)
-    vars_all = [''.join(random.choices(string.ascii_uppercase, k=k)).upper() for _ in range((num_hops+1) * num_chains)]
-    while len(set(vars_all)) < num_chains * (num_hops+1):
-        vars_all.append(''.join(random.choices(string.ascii_uppercase, k=k)).upper())
+    need = (num_hops+1) * num_chains
+
+    # Draw DISTINCT names, keeping the list at exactly `need`.
+    #
+    # This used to draw `need` names at once and then, on a collision, append more until
+    # the SET was large enough -- which left the LIST longer than `need`. The grouping
+    # loop below walks that list with a fixed stride of num_hops+1, so the extra entries
+    # formed a final short group and `this_vars[j+1]` raised IndexError. Any collision
+    # was therefore a hard crash of data generation, not a degraded sample.
+    #
+    # It went unnoticed because the odds scale with the square of the name count. The
+    # ICL example that main() builds first uses k=3 (17,576 possible names), so at the
+    # RULER default of one chain it is a ~3% flake across a whole run, but at four
+    # chains it is ~43% and at eight ~90%.
+    #
+    # Distinctness is required, not cosmetic: a name repeated across two chains would
+    # make the assignment graph ambiguous, and one repeated inside a chain would make
+    # the chain self-referential.
+    space = 26 ** k
+    if need > space // 2:
+        # Rejection sampling degrades badly as the space fills, and past it the loop
+        # cannot terminate at all. Fail with the arithmetic rather than hang.
+        raise RuntimeError(
+            f"variable_tracking: {num_chains} chains of {num_hops} hops need {need} "
+            f"distinct {k}-letter names, which is too many to draw from {space}. "
+            f"Lower --num_chains/--num_hops."
+        )
+    vars_all = []
+    seen = set()
+    while len(vars_all) < need:
+        # Redrawing only on a collision keeps the RNG stream identical to the old code
+        # whenever the old code would have succeeded, so seeds reproduce byte for byte.
+        var = ''.join(random.choices(string.ascii_uppercase, k=k)).upper()
+        if var in seen:
+            continue
+        seen.add(var)
+        vars_all.append(var)
 
     vars_ret = []
     chains_ret = []
