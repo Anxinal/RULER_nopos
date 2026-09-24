@@ -110,9 +110,20 @@ vt:
 # a positional failure rather than a harder problem. Raising num_chains keeps that
 # property; raising num_hops would not.
 #
-# Chain text is cheap, so neither variant crowds out the haystack: at a 2048 budget the
-# links are about 6% of the context at four chains and 12% at eight, leaving ~70 and
-# ~65 noise blocks respectively.
+# Chain text is cheap, so none of these crowds out the haystack: at a 2048 budget the
+# links are roughly 3% of the context at two chains, 6% at four and 12% at eight.
+#
+# The grid uses vt_2chain and vt_4chain; vt_8chain is kept defined but unselected, like
+# the other catalogue entries here. Note the few-shot example variable_tracking.py
+# prepends to every sample grows with the chain count too (~25% of a 2048 context at
+# four chains, ~31% at eight), which is a second reason to prefer the smaller pair.
+vt_2chain:
+  task: variable_tracking
+  args:
+    type_haystack: noise
+    num_chains: 2
+    num_hops: 4
+
 vt_4chain:
   task: variable_tracking
   args:

@@ -260,13 +260,31 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_noises = int((max_seq_length / tokens_per_haystack) * 3)
 
+    # Smallest haystack `generate_input_output` can actually build.
+    #
+    # The noise branch inserts each chain with
+    # `random.sample(range(len(sentences)), len(chain))`, which needs at least one
+    # position per link, so the haystack cannot start smaller than a single chain --
+    # num_hops+1 units. Below that, random.sample raises "Sample larger than population"
+    # rather than returning a shorter sample. Note the floor depends on num_hops only:
+    # later chains sample from a list that earlier insertions have already grown.
+    #
+    # The essay branch has no such floor -- it slices sentences by depth percentage and
+    # copes with a short document -- so it keeps 1.
+    min_noises = (num_hops + 1) if args.type_haystack == 'noise' else 1
+
     # Binary search for optimal haystack size.
-    # NOTE: the lower bound must be 1, not `incremental`. If it is `incremental` and even
-    # that smallest size overflows the budget (which happens at short --max_seq_length),
-    # the search returns nothing, `num_noises` falls back to `incremental`, and the
-    # size-reduction loop below can never decrement -- an unrecoverable silent hang.
-    lower_bound = 1
-    upper_bound = max(estimated_max_noises, incremental * 2)  # Ensure upper_bound is reasonable
+    # NOTE: the lower bound must be `min_noises`, not `incremental`. If it is
+    # `incremental` and even that smallest size overflows the budget (which happens at
+    # short --max_seq_length), the search returns nothing, `num_noises` falls back to
+    # `incremental`, and the size-reduction loop below can never decrement -- an
+    # unrecoverable silent hang. It must not be below `min_noises` either: the search
+    # probes small sizes whenever the budget is tight, and every probe below the floor
+    # is a ValueError out of random.sample. That is why this surfaced only once
+    # num_chains went up -- more chain text leaves less room, so the search reaches
+    # further down.
+    lower_bound = min_noises
+    upper_bound = max(estimated_max_noises, incremental * 2, min_noises)
 
     optimal_num_noises = None
 
@@ -289,9 +307,11 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
 
     if optimal_num_noises is None:
         raise RuntimeError(
-            f"variable_tracking/{args.save_name}: cannot fit even a single noise unit "
-            f"within max_seq_length={max_seq_length} with num_chains={num_chains}, "
-            f"num_hops={num_hops}. Raise --max_seq_length."
+            f"variable_tracking/{args.save_name}: cannot fit the smallest buildable "
+            f"haystack ({min_noises} noise unit(s)) within max_seq_length="
+            f"{max_seq_length} with num_chains={num_chains}, num_hops={num_hops}. "
+            f"The chains alone are too long for the budget -- raise --max_seq_length "
+            f"or lower --num_chains."
         )
     num_noises = optimal_num_noises
     logger.info(f'Final optimal haystack size (number of haystack): {num_noises}')
@@ -312,13 +332,19 @@ def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, increment
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                # Decrement toward a floor of 1 and fail loudly rather than spinning forever.
-                if used_noises <= 1:
+                # Decrement toward the smallest buildable haystack and fail loudly rather
+                # than spinning forever. The floor is min_noises, not 1: going below it
+                # swaps the "too long" ValueError for a "Sample larger than population"
+                # one, which this bare except would swallow and retry until the counter
+                # bottomed out, reporting a length problem that was really a floor
+                # violation.
+                if used_noises <= min_noises:
                     raise RuntimeError(
                         f"variable_tracking/{args.save_name}: sample {index} does not fit "
-                        f"within max_seq_length={max_seq_length} even with a single noise unit."
+                        f"within max_seq_length={max_seq_length} even at the smallest "
+                        f"buildable haystack ({min_noises} noise unit(s))."
                     )
-                used_noises = max(1, used_noises - incremental)
+                used_noises = max(min_noises, used_noises - incremental)
 
         if final_output:
             answer_prefix_index = input_text.rfind(TASKS['variable_tracking']['answer_prefix'][:10]) # use first 10 char of answer prefix to locate it
@@ -348,8 +374,30 @@ def main():
     save_file = args.save_dir / f'{args.save_name}' / f'{args.subset}.jsonl'
     save_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # The few-shot example is prepended to every sample, and its budget was a hardcoded
+    # 500 tokens. That is not a property of the example but of how much chain text it
+    # has to contain: a minimal one costs 247 tokens at one chain, 404 at four and 627
+    # at eight, so from eight chains up it could not be built at all and generation died
+    # before writing a line. Size it from the real minimum, with 500 as a floor so every
+    # configuration that already fitted keeps generating byte-identical data.
+    #
+    # The 15% slack matters: variable names are random and a 3-letter name is two or
+    # three GPT-2 tokens, so the same configuration varies by a few dozen tokens between
+    # draws. A budget set at exactly the measured minimum fails on an unlucky one.
+    min_noises = (args.num_hops + 1) if args.type_haystack == 'noise' else 1
+    _rng_state, _np_state = random.getstate(), np.random.get_state()
+    _probe, _ = generate_input_output(min_noises, args.num_chains, args.num_hops,
+                                      is_icl=True)
+    # Rewind both RNGs. Measuring must not consume draws, or every sample downstream
+    # would shift and the same --random_seed would stop reproducing earlier datasets.
+    random.setstate(_rng_state)
+    np.random.set_state(_np_state)
+    icl_budget = max(500, int(len(TOKENIZER.text_to_tokens(_probe)) * 1.15))
+    logger.info(f"Few-shot example budget: {icl_budget} tokens "
+                f"(minimum for {args.num_chains} chain(s): {len(TOKENIZER.text_to_tokens(_probe))})")
+
     icl_example = sys_vartrack_w_noise_random(num_samples=1,
-                                              max_seq_length=500,
+                                              max_seq_length=icl_budget,
                                               incremental=5,
                                               num_chains=args.num_chains,
                                               num_hops=args.num_hops)[0]

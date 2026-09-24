@@ -268,18 +268,21 @@ done
 source "${SCRIPT_DIR}/config_tasks.sh"
 # An explicit include list, not the full synthetic[@] suite: two multi-chain variable
 # tracking tasks and the three multi-key needle tasks, of which four are trained on and
-# one (vt_8chain) is held out for evaluation only -- see the split below. Known
+# one (vt_4chain) is held out for evaluation only -- see the split below. Known
 # properties worth keeping in mind when reading results, since each one bears on whether
 # a drop with length is positional:
 #
-#   vt_4chain, vt_8chain  four and eight assignment chains in a noise haystack, four
+#   vt_2chain, vt_4chain  two and four assignment chains in a noise haystack, four
 #                  hops each. Both counts are fixed, so 4x the context is 4x the
 #                  distance between links and nothing else -- the property that makes a
 #                  2048 -> 8192 drop readable as positional. The noise haystack is one
 #                  sentence repeated, so samples come out near-uniform in length and
 #                  batches are barely ragged. The answer is a set of five variable
 #                  names, which resists the answer-prior basin better than a single
-#                  number does.
+#                  number does. vt_8chain exists in synthetic.yaml and works, but is not
+#                  selected: its few-shot prefix alone eats ~31% of a 2048 context
+#                  against ~25% at four chains and ~21% at two, so the overhead would
+#                  vary more across the pair than the thing being measured.
 #   niah_multikey_1  essay haystack with 4 key/value needles; the query must pick one.
 #                  Needle count is fixed, but the essay is always the corpus prefix, so
 #                  eval at 8192 contains text never seen at the 2048 training length.
@@ -299,13 +302,15 @@ source "${SCRIPT_DIR}/config_tasks.sh"
 # gives a second generalisation axis orthogonal to length:
 #
 #                        2048 (train len)   4096   8192
-#   vt_4chain (trained)  in-distribution    len    len
-#   vt_8chain (held out) distractors        both   both
+#   vt_2chain (trained)  in-distribution    len    len
+#   vt_4chain (held out) distractors        both   both
 #
-# vt_8chain differs from vt_4chain only in the number of distractor chains -- same hop
+# vt_4chain differs from vt_2chain only in the number of distractor chains -- same hop
 # count, same noise haystack, same five-variable answer, same template -- so a drop from
 # the first row to the second isolates distractor count the way a drop across a row
-# isolates length. It costs no training time, only the eval data and the prediction pass.
+# isolates length. Doubling is the smallest step that is still a real change, which
+# keeps the confound small: the few-shot prefix each sample carries grows with the chain
+# count, so a wider gap would vary that overhead alongside the variable being tested. It costs no training time, only the eval data and the prediction pass.
 #
 # Every training task is also an evaluation task, so TASKS below is the union and is
 # exactly what gets scored. Only generate_train_data reads TRAIN_TASKS.
@@ -318,8 +323,8 @@ if $SANITY; then
     TRAIN_TASKS=("${SANITY_TASKS[@]}")
     EVAL_ONLY_TASKS=()
 else
-    TRAIN_TASKS=("vt_4chain" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
-    EVAL_ONLY_TASKS=("vt_8chain")
+    TRAIN_TASKS=("vt_2chain" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
+    EVAL_ONLY_TASKS=("vt_4chain")
 fi
 # `${arr[@]+...}` because 'set -u' aborts on an empty array expansion in older bash,
 # and EVAL_ONLY_TASKS is empty in sanity mode.
