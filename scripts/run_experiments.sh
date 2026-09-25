@@ -31,14 +31,14 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-12:00:00}"
+TIME="${TIME:-16:00:00}"
 # Checkpoints are deleted once a cell has been evaluated at every length, since
 # the predictions and summaries are what the analysis reads. At ~0.9 GB per cell
 # this is the difference between ~8 GB and ~0 GB of standing disk. Set true to keep
 # them, e.g. to re-run evaluation later without retraining.
 KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-false}"
 # Reuse an existing checkpoint instead of retraining, so a cell whose evaluation was cut
-# short (a TIME kill lands before the checkpoint is deleted) can be resubmitted and go
+# short (a TIME kill lands before the checkpoint s deleted) can be resubmitted and go
 # straight to prediction. call_api.py resumes by sample index, so prediction continues
 # where it stopped rather than starting over. RETRAIN=true forces training regardless.
 RETRAIN="${RETRAIN:-false}"
@@ -76,7 +76,7 @@ TORCH_SPEC="${TORCH_SPEC:-}"
 # 4-future split is the object under study. head_dim is 512/8 = 64, the usual value.
 D_MODEL=512
 NUM_HEADS=8
-NUM_LAYERS=6
+NUM_LAYERS=8
 D_FF=2048
 # 0.0, not 0.2. embed_dropout is applied to the SUM of the token embedding and the
 # additive positional encoding, so for the sinusoidal arms it randomly deletes 20% of a
@@ -112,7 +112,7 @@ TRAIN_SEED=1234
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=1000
-# QA questions reserved for evaluation. DORMANT while no qa_* task is in TASKS: the
+# QA questions reserved for evaluation. DORMANT while no qa_* task is selected: the
 # --qa_start/--qa_end flags below are still passed to prepare.py, which forwards them
 # only for tasks whose generator is qa.py, so they are a no-op for the current suite.
 # Kept because the split is a correctness requirement, not a tuning knob, the moment a
@@ -125,7 +125,7 @@ EVAL_SAMPLES=1000
 # training takes [QA_HOLDOUT, end). The margin over EVAL_SAMPLES absorbs questions
 # skipped for not fitting the length budget.
 QA_HOLDOUT=2000
-EVAL_SEED=42                # RULER default
+EVAL_SEED=62                # RULER default
 
 # ====================== TRAINING =============================================
 EPOCHS=30
@@ -266,9 +266,9 @@ done
 
 # Task list (must match entries in synthetic.yaml)
 source "${SCRIPT_DIR}/config_tasks.sh"
-# An explicit include list, not the full synthetic[@] suite: two multi-chain variable
-# tracking tasks and the three multi-key needle tasks, of which four are trained on and
-# one (vt_4chain) is held out for evaluation only -- see the split below. Known
+# An explicit include list, not the full synthetic[@] suite: three variable-tracking
+# configurations, three multi-key needle tasks and one single-needle task. Which of them
+# are trained on and which are scored are two separate lists -- see the split below. Known
 # properties worth keeping in mind when reading results, since each one bears on whether
 # a drop with length is positional:
 #
@@ -297,9 +297,15 @@ source "${SCRIPT_DIR}/config_tasks.sh"
 # tasks whose sample lengths vary by hundreds of tokens, because qa.py shrinks the
 # haystack per question until it fits; that makes every batch ragged with padding.
 #
-# The task list is split the same way the sequence lengths are. TRAIN_TASKS is what the
-# model sees; EVAL_ONLY_TASKS is held out entirely and scored but never trained on, which
-# gives a second generalisation axis orthogonal to length:
+# Two independent lists, the same way the sequence lengths are two independent lists.
+# TRAIN_TASKS is what the model sees, EVAL_TASKS is what it is scored on, and neither is
+# derived from the other. A task therefore sits in one of three places, all deliberate:
+#
+#   both         the normal case: an in-distribution score for a task that was trained
+#   eval only    held out -- scored but never trained, a generalisation probe
+#   train only   curriculum -- shapes the model, but is not a question being asked
+#
+# The eval-only slot gives a generalisation axis orthogonal to length:
 #
 #                        2048 (train len)   4096   8192
 #   vt_2chain (trained)  in-distribution    len    len
@@ -307,13 +313,50 @@ source "${SCRIPT_DIR}/config_tasks.sh"
 #
 # vt_4chain differs from vt_2chain only in the number of distractor chains -- same hop
 # count, same noise haystack, same five-variable answer, same template -- so a drop from
-# the first row to the second isolates distractor count the way a drop across a row
+# the second row to the first isolates distractor count the way a drop across a row
 # isolates length. Doubling is the smallest step that is still a real change, which
 # keeps the confound small: the few-shot prefix each sample carries grows with the chain
-# count, so a wider gap would vary that overhead alongside the variable being tested. It costs no training time, only the eval data and the prediction pass.
+# count, so a wider gap would vary that overhead alongside the variable being tested. It
+# costs no training time, only the eval data and one prediction pass.
 #
-# Every training task is also an evaluation task, so TASKS below is the union and is
-# exactly what gets scored. Only generate_train_data reads TRAIN_TASKS.
+# The train-only slot holds three CURRICULUM tasks, which shape the model but are not
+# questions being asked. The previous suite was multi-key needles and multi-chain
+# tracking only, and every arm floored at 0.0 on all three needle tasks -- emitting
+# numbers that appear nowhere in the context (297/300, 300/300, 300/300 sampled), which
+# is a copy circuit that never formed rather than one retrieving the wrong needle. The
+# suite before it, which did reach 98-100, contained the easy rungs. Each of these is
+# the trivial step of a ladder whose hard steps are scored, and each isolates ONE axis
+# that a scored task otherwise changes two or three of at once:
+#
+#   niah_single_1  noise haystack, 1 needle, 7-digit answer. The cheapest possible
+#                  example of "the answer is a span of the input" -- somewhere easy for
+#                  the gradient to start.
+#   niah_single_3  essay haystack, 1 needle, UUID answer. The only task here that
+#                  teaches a ~20-token exact copy, which niah_multikey_3 requires and
+#                  nothing else supplies; from niah_single_1 that is a 3-token answer
+#                  becoming a 20-token one. It reached 98-100 in the suite that worked,
+#                  so it is known to be learnable at this size.
+#   vt             1 chain, the same job for following a chain rather than finding a
+#                  span.
+#
+#   needles: niah_single_1 (1 needle)  ->  niah_single_3 (long copy)
+#                                       -> niah_multikey_1/2/3 (pick among distractors)
+#   chains:  vt (1 chain)  ->  vt_2chain (2, scored)  ->  vt_4chain (4, held out)
+#
+# None of the three is scored: each is a column every arm would be expected to pass, and
+# the run is already 6 evaluated task-columns wide. Note the consequence -- vt is
+# RULER's own shipped variable-tracking configuration, so with it unscored NO scored
+# task here is unmodified RULER, and these numbers are not comparable to published ones.
+# Move vt back into EVAL_TASKS if that comparison is wanted.
+#
+# The essay-haystack curriculum task is safe HERE in a way it would not be if scored:
+# niah_single_2/3 were dropped from the scored suite because the essay haystack is
+# always the corpus prefix, so evaluating at 8192 shows text never seen at 2048. That is
+# an evaluation-side confound, and it simply does not arise for a task that is only ever
+# trained at 2048. The train-only slot is where tasks with eval-side confounds belong.
+#
+# ALL_TASKS is the union, and exists only for the two things that need a task's data or
+# corpus regardless of which side it sits on: the yaml check and fetch_corpora.
 if $SANITY; then
     # Applied here, not in the sanity block above, because this line would otherwise
     # overwrite it -- config_tasks.sh is sourced after the grid is configured. The
@@ -321,34 +364,47 @@ if $SANITY; then
     # the pipeline can learn at all, so holding anything out would only add a way for it
     # to fail that says nothing about the pipeline.
     TRAIN_TASKS=("${SANITY_TASKS[@]}")
-    EVAL_ONLY_TASKS=()
+    EVAL_TASKS=("${SANITY_TASKS[@]}")
 else
-    TRAIN_TASKS=("vt_2chain" "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
-    EVAL_ONLY_TASKS=("vt_4chain")
+    TRAIN_TASKS=("niah_single_1" "niah_single_3" "vt" "vt_2chain"
+                 "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
+    EVAL_TASKS=("vt_2chain" "vt_4chain"
+                "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
 fi
-# `${arr[@]+...}` because 'set -u' aborts on an empty array expansion in older bash,
-# and EVAL_ONLY_TASKS is empty in sanity mode.
-TASKS=("${TRAIN_TASKS[@]}" ${EVAL_ONLY_TASKS[@]+"${EVAL_ONLY_TASKS[@]}"})
+
+# Union, order preserving. Nothing outside this loop should iterate both lists.
+ALL_TASKS=()
+for _t in "${TRAIN_TASKS[@]}" "${EVAL_TASKS[@]}"; do
+    case " ${ALL_TASKS[*]:-} " in
+        *" ${_t} "*) ;;
+        *) ALL_TASKS+=("${_t}") ;;
+    esac
+done
 
 # Fail here rather than partway through a submission: prepare.py looks each task up in
 # synthetic.yaml, and a typo would otherwise surface one task into data generation.
-for _t in "${TASKS[@]}"; do
+for _t in "${ALL_TASKS[@]}"; do
     if ! grep -qE "^${_t}:" "${SCRIPT_DIR}/synthetic.yaml"; then
         echo "ERROR: task '${_t}' is not defined in ${SCRIPT_DIR}/synthetic.yaml." >&2
         exit 1
     fi
 done
-# A held-out task that is silently also trained on is the one mistake this split can
-# make, and it would look like a strong generalisation result rather than an error.
-for _t in ${EVAL_ONLY_TASKS[@]+"${EVAL_ONLY_TASKS[@]}"}; do
-    case " ${TRAIN_TASKS[*]} " in
-        *" ${_t} "*)
-            echo "ERROR: '${_t}' is in both TRAIN_TASKS and EVAL_ONLY_TASKS." >&2
-            exit 1 ;;
-    esac
+# Print the split rather than validate it. With two independent lists there is no
+# illegal combination left to detect -- train-only and eval-only are both intended --
+# but a task landing on the wrong side is silent and costs a whole run, so name each.
+_both=() _train_only=() _eval_only=()
+for _t in "${ALL_TASKS[@]}"; do
+    case " ${TRAIN_TASKS[*]} " in *" ${_t} "*) _in_train=true ;; *) _in_train=false ;; esac
+    case " ${EVAL_TASKS[*]} "  in *" ${_t} "*) _in_eval=true  ;; *) _in_eval=false  ;; esac
+    if   $_in_train && $_in_eval; then _both+=("${_t}")
+    elif $_in_train;              then _train_only+=("${_t}")
+    else                               _eval_only+=("${_t}")
+    fi
 done
-echo "Tasks: ${#TASKS[@]} total | train ${#TRAIN_TASKS[@]} (${TRAIN_TASKS[*]})"
-echo "       held out for eval only: ${EVAL_ONLY_TASKS[*]:-none}"
+echo "Tasks: ${#ALL_TASKS[@]} total"
+echo "  trained and scored  : ${_both[*]:-none}"
+echo "  train only (curric) : ${_train_only[*]:-none}"
+echo "  eval only (held out): ${_eval_only[*]:-none}"
 
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
@@ -593,7 +649,7 @@ CORPUS_DIR="${SCRIPT_DIR}/data/synthetic/json"
 fetch_corpora() {
     echo "--- Checking source corpora in ${CORPUS_DIR} ---"
 
-    # Only fetch what the selected TASKS actually read. Most needle tasks use the noise
+    # Only fetch what the selected tasks actually read. Most needle tasks use the noise
     # or needle haystacks and need no corpus at all, so a run restricted to those --
     # --sanity in particular -- should not pull down three datasets it will never open.
     # Which tasks use the essay haystack is set in synthetic.yaml (type_haystack: essay).
@@ -603,7 +659,7 @@ fetch_corpora() {
     # was never fetched and generation failed on the missing file.
     local essay_tasks=" niah_single_2 niah_single_3 niah_multikey_1 niah_multivalue niah_multiquery "
     local want_essay=false want_qa=false
-    for t in "${TASKS[@]}"; do
+    for t in "${ALL_TASKS[@]}"; do
         case "${essay_tasks}" in *" ${t} "*) want_essay=true ;; esac
         case "${t}" in qa_*) want_qa=true ;; esac
     done
@@ -673,7 +729,7 @@ generate_eval_data() {
     for SEQ_LEN in "${EVAL_SEQ_LENGTHS[@]}"; do
         local DATA_DIR="${EVAL_DATA_ROOT}/${SEQ_LEN}/data"
         mkdir -p "${DATA_DIR}"
-        for TASK in "${TASKS[@]}"; do
+        for TASK in "${EVAL_TASKS[@]}"; do
             python "${SCRIPT_DIR}/data/prepare.py" \
                 --save_dir   "${DATA_DIR}" \
                 --benchmark  synthetic \
@@ -694,9 +750,9 @@ generate_train_data() {
     for SEQ_LEN in "${TRAIN_SEQ_LENGTHS[@]}"; do
         DATA_DIR="${TRAIN_DATA_DIR}/${SEQ_LEN}/data"
         mkdir -p "${DATA_DIR}"
-        # TRAIN_TASKS, not TASKS. train.py globs this whole tree recursively, so a
-        # held-out task generated here would be trained on no matter what the task
-        # list says.
+        # TRAIN_TASKS, not ALL_TASKS. train.py globs this whole tree recursively, so
+        # an eval-only task generated here would be trained on regardless of what the
+        # task lists say. This is what actually enforces the split.
         for TASK in "${TRAIN_TASKS[@]}"; do
             python "${SCRIPT_DIR}/data/prepare.py" \
                 --save_dir   "${DATA_DIR}" \
@@ -846,7 +902,7 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
         local PRED_DIR="${RESULTS}/pred"
         mkdir -p "${PRED_DIR}"
 
-        for TASK in "${TASKS[@]}"; do
+        for TASK in "${EVAL_TASKS[@]}"; do
             # predict
             local CAP
             CAP="$(answer_token_cap "${EVAL_DATA}/${TASK}/validation.jsonl")"
@@ -907,7 +963,7 @@ if ! $LOCAL && ! $DRY_RUN; then
 set -euo pipefail
 # Variables first: setup_env reads VENV_DIR and friends, and under 'set -u'
 # referencing them before they are declared aborts the job immediately.
-$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER TASKS TRAIN_TASKS \
+$(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER ALL_TASKS TRAIN_TASKS EVAL_TASKS \
              TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED QA_HOLDOUT)
 $(declare -f setup_env)
@@ -985,7 +1041,7 @@ $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEA
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
              BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC \
-             EVAL_SEED QA_HOLDOUT TASKS SCRIPT_DIR)
+             EVAL_SEED QA_HOLDOUT EVAL_TASKS SCRIPT_DIR)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
