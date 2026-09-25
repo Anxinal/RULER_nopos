@@ -127,20 +127,42 @@ def generate_chains(num_chains, num_hops, is_icl=False):
         # Redrawing only on a collision keeps the RNG stream identical to the old code
         # whenever the old code would have succeeded, so seeds reproduce byte for byte.
         var = ''.join(random.choices(string.ascii_uppercase, k=k)).upper()
-        if var in seen:
+        # "VAR" itself is excluded: it is the keyword every assignment starts with, so a
+        # variable of that name makes the text unparseable for anything that reads the
+        # chains back, randomize_icl included.
+        if var in seen or var == "VAR":
             continue
         seen.add(var)
         vars_all.append(var)
+
+    # DISTINCT root values, one per chain.
+    #
+    # The query is "find all variables assigned the value V", so two chains sharing a
+    # root value means two chains answer it while `answers` returns only chain 0's --
+    # the sample is then simply mislabelled. Drawing independently per chain made that
+    # a 1-in-90,000 event per pair, which is rare enough never to be noticed and common
+    # enough to mislabel a couple of samples in a 25k-sample training set.
+    #
+    # The is_icl branch was worse than rare, it was certain: every chain was seeded with
+    # the literal 12345 so that randomize_icl could find and swap it, and that swap
+    # rewrote all of them to the same new value. At RULER's shipped num_chains=1 there
+    # is only one root, so neither problem can occur; both appear the moment there are
+    # two.
+    values_all = []
+    seen_values = set()
+    while len(values_all) < num_chains:
+        value = str(np.random.randint(10000, 99999))
+        if value in seen_values:
+            continue
+        seen_values.add(value)
+        values_all.append(value)
 
     vars_ret = []
     chains_ret = []
     for i in range(0, len(vars_all), num_hops+1):
         this_vars = vars_all[i:i+num_hops+1]
         vars_ret.append(this_vars)
-        if is_icl:
-            this_chain = [f"VAR {this_vars[0]} = 12345"]
-        else:
-            this_chain = [f"VAR {this_vars[0]} = {str(np.random.randint(10000, 99999))}"]
+        this_chain = [f"VAR {this_vars[0]} = {values_all[i // (num_hops+1)]}"]
         for j in range(num_hops):
             this_chain.append(f"VAR {this_vars[j+1]} = VAR {this_vars[j]} ")
         chains_ret.append(this_chain)
@@ -210,16 +232,66 @@ def generate_input_output(num_noises, num_chains, num_hops, is_icl=False):
     return input_text, vars[0]
 
 def randomize_icl(icl_example):
-    icl_tgt = icl_example.strip().split()[-args.num_hops-1:]
-    for item in icl_tgt:
-        new_item = ''.join(random.choices(string.ascii_uppercase, k=len(item))).upper()
-        icl_example = icl_example.replace(item, new_item)
+    """Re-randomise every surface form in the cached few-shot example.
 
-    old_value = "12345"
-    new_value = str(np.random.randint(10000, 99999))
-    icl_example = icl_example.replace(old_value, new_value)
+    The example is built once and prepended to every sample, so this is the only thing
+    stopping it from being identical text 25,000 times over. It must therefore rewrite
+    *every* variable name and *every* root value, and must do so in a single pass.
 
-    return icl_example
+    All three of the following were wrong, and all three are invisible at RULER's
+    shipped num_chains=1, which is the only variable-tracking configuration the
+    benchmark defines:
+
+    * Only the answer chain was renamed. ``split()[-num_hops-1:]`` takes the trailing
+      answer, which at one chain is every name in the example; with more chains, every
+      distractor chain's names stayed frozen for the life of the dataset.
+    * Every root was the literal ``12345`` and a single ``str.replace`` rewrote them all
+      to one new value, so the demonstrated question had ``num_chains * (num_hops+1)``
+      correct answers while the demonstrated answer listed ``num_hops+1`` of them and
+      the sentence above it asserted that was the count.
+    * Replacements were applied one at a time, so a freshly drawn name could collide
+      with a name still queued for replacement, or be rewritten again by a later
+      iteration -- observed in 5 of 1000 records at four chains, producing a variable
+      that was both a chain root and a link in a different chain.
+
+    Names keep their original length so the token budget measured in ``main`` still
+    holds, and the replacement pass is simultaneous, so a new name colliding with an
+    old one is harmless: the old one is being replaced in the same pass and the result
+    is never rescanned.
+    """
+    # Every variable appears after the VAR keyword at least once (a root as
+    # "VAR x = <n>", a link as "VAR x = VAR y"), so this finds all of them. The answer
+    # line lists names without the keyword, but they are all chain variables and so are
+    # already in this set; rewriting on word boundaries catches them there too.
+    names = sorted(set(re.findall(r"VAR ([A-Z]+)", icl_example)))
+    values = sorted(set(re.findall(r"VAR [A-Z]+ = (\d+)", icl_example)))
+
+    mapping = {}
+    used = set()
+    for name in names:
+        while True:
+            new_name = ''.join(random.choices(string.ascii_uppercase, k=len(name))).upper()
+            if new_name != "VAR" and new_name not in used:
+                break
+        used.add(new_name)
+        mapping[name] = new_name
+    used_values = set()
+    for value in values:
+        while True:
+            new_value = str(np.random.randint(10000, 99999))
+            if new_value not in used_values:
+                break
+        used_values.add(new_value)
+        mapping[value] = new_value
+
+    if not mapping:
+        return icl_example
+    # One simultaneous pass. Word boundaries keep a value from matching inside a longer
+    # number and a name from matching inside a longer word, and they let the question
+    # line ("assigned the value 38693") and the answer line be rewritten consistently
+    # with the assignments.
+    pattern = re.compile(r"\b(" + "|".join(re.escape(t) for t in mapping) + r")\b")
+    return pattern.sub(lambda m: mapping[m.group(0)], icl_example)
 
 def sys_vartrack_w_noise_random(num_samples: int, max_seq_length: int, incremental: int = 10,
                                 num_chains: int = 1, num_hops: int = 4,
