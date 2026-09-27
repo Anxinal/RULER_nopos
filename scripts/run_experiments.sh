@@ -183,6 +183,20 @@ EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
 # a step size large enough to explore. The arm that solved the task escaped at epoch 8
 # with LR near peak; failing arms were at 5e-5 by the time they stopped.
 MIN_LR_FRAC="${MIN_LR_FRAC:-0.25}"
+# Mixed-precision dtype: bf16 or fp16.
+#
+# bf16. fp16's ceiling is 65504, and an fp16 run needs a GradScaler, which halves its
+# scale on ANY non-finite gradient but only grows back after 2000 CONSECUTIVE clean
+# steps. So a sustained non-finite rate above 1/2000 = 0.05% drives the scale
+# monotonically to zero, and once it is below 1 the gradients underflow and every
+# optimizer step becomes a no-op while the loss stays finite -- invisible without the
+# per-epoch `amp:` line. Measured here: 4 skipped steps per epoch (0.14%) took the scale
+# from 65536 to below 1 in four epochs and destroyed a run that had reached ppl 1.7.
+#
+# bf16 carries fp32's exponent range, so it needs no scaler and nothing can collapse.
+# H100 supports it natively, at no throughput cost. train.py refuses --bf16 on a GPU
+# without support rather than falling back silently.
+PRECISION="${PRECISION:-bf16}"
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 SEED=42
@@ -402,6 +416,11 @@ for _t in "${TRAIN_TASKS[@]}" "${EVAL_TASKS[@]}"; do
         *) ALL_TASKS+=("${_t}") ;;
     esac
 done
+
+case "${PRECISION}" in
+    bf16|fp16) ;;
+    *) echo "ERROR: PRECISION='${PRECISION}' must be bf16 or fp16." >&2; exit 1 ;;
+esac
 
 # Fail here rather than partway through a submission: prepare.py looks each task up in
 # synthetic.yaml, and a typo would otherwise surface one task into data generation.
@@ -912,7 +931,7 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
         --warmup_steps "${WARMUP}" \
         --min_lr_frac  "${MIN_LR_FRAC}" \
         --seed         "${SEED}" \
-        --fp16 \
+        "--${PRECISION}" \
         --output_dir   "${EXP_DIR}"
     fi
 
@@ -1061,7 +1080,7 @@ $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_
 $(declare -p KEEP_CHECKPOINTS RETRAIN SANITY SANITY_MIN_SCORE)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
              NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
-             BATCH_SIZE GRAD_ACCUM LR WARMUP SEED EVAL_SEQ_LENGTHS EVAL_SAMPLES \
+             BATCH_SIZE GRAD_ACCUM LR WARMUP SEED PRECISION EVAL_SEQ_LENGTHS EVAL_SAMPLES \
              EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC \
              EVAL_SEED QA_HOLDOUT EVAL_TASKS SCRIPT_DIR)
 $(declare -f setup_env)

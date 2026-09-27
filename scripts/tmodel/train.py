@@ -299,7 +299,7 @@ MAX_ZERO_GRAD_STEPS = 50
 
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
               scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
-              accum_steps=1):
+              accum_steps=1, amp_dtype=None):
     """Run one training or validation epoch.  Pass *optimizer=None* for eval.
 
     ``accum_steps`` batches are accumulated before each optimizer step, so the
@@ -322,7 +322,10 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
     model.train(is_train)
     total_loss = 0.0
     total_tokens = 0
-    use_amp = scaler is not None
+    # Autocast is driven by amp_dtype, NOT by the presence of a scaler. bf16 wants
+    # autocast with no scaler at all: it has fp32's exponent range, so there is nothing
+    # to scale away from and no scale that could collapse.
+    use_amp = amp_dtype is not None
     n_batches = len(loader)
     spike_threshold = LOSS_SPIKE_FACTOR * math.log(vocab_size)
 
@@ -344,7 +347,7 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
 
         # A fresh autocast context per batch; reusing one instance across the loop
         # relies on re-entrancy that is not guaranteed.
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             logits = model(src, tgt_in)
             loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
 
@@ -456,8 +459,10 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                     "gnorm %.2f | lr %.2e%s",
                     step, n_batches, avg, len(recent), win, math.exp(min(win, 20)),
                     grad_norm, cur_lr,
-                    (f" | scale {stats['scale']:.0f}"
-                     if use_amp and math.isfinite(stats["scale"]) else "")
+                    # %g, not %.0f: a collapsing scale passes through 0.5, 0.25, ...
+                    # and %.0f printed every one of those as "0".
+                    (f" | scale {stats['scale']:g}"
+                     if math.isfinite(stats["scale"]) else "")
                     + (f" | {stats['n_skipped_steps']} step(s) skipped"
                        if stats["n_skipped_steps"] else "")
                     + (f" | SKIPPED {stats['n_nonfinite']} non-finite batch(es)"
@@ -615,8 +620,38 @@ def main(args):
             init_loss / expected,
         )
 
-    use_amp = args.fp16 and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # Precision. bf16 is preferred and is what --bf16 selects: it carries fp32's
+    # exponent range (max ~3.4e38 against fp16's 65504), so neither activations nor
+    # intermediates in the attention backward overflow, and it needs no GradScaler.
+    #
+    # That last point is the one that matters here. GradScaler responds to ANY non-finite
+    # gradient by halving its scale, but it only grows back after 2000 CONSECUTIVE clean
+    # steps -- so a sustained non-finite rate above 1/2000 = 0.05% drives the scale
+    # monotonically to zero, after which fp16 gradients underflow and every optimizer
+    # step becomes a no-op. Observed here: 4 skips/epoch took the scale from 65536 to
+    # below 1 in four epochs, at which point a run sitting at ppl 1.7 came apart. Worse,
+    # halving cannot fix a non-finite gradient that is not a scaling overflow, and at
+    # scale 2 a final gradient would have to exceed 32,752 to be one.
+    amp_dtype = None
+    if args.bf16 and args.fp16:
+        raise ValueError("pass --bf16 or --fp16, not both")
+    if device.type != "cuda":
+        if args.bf16 or args.fp16:
+            log.warning("Mixed precision requested but no CUDA device; running fp32.")
+    elif args.bf16:
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "--bf16 requested but this GPU does not support bfloat16. Use --fp16, "
+                "and watch the per-epoch 'amp:' line for a falling scaler scale."
+            )
+        amp_dtype = torch.bfloat16
+    elif args.fp16:
+        amp_dtype = torch.float16
+    use_amp = amp_dtype is not None
+    # A scaler is needed for fp16 only. Under bf16 it would be a no-op at best and a
+    # source of the collapse above at worst.
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype is torch.float16)
+    log.info("Precision: %s", "fp32" if not use_amp else str(amp_dtype).replace("torch.", ""))
 
     # ---- output dir -----------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
@@ -648,7 +683,8 @@ def main(args):
         train_loss, train_stats = run_epoch(
             model, train_loader, criterion, vocab_size, device,
             optimizer=optimizer, scheduler=scheduler,
-            scaler=scaler if use_amp else None,
+            scaler=scaler if amp_dtype is torch.float16 else None,
+            amp_dtype=amp_dtype,
             grad_clip=args.grad_clip, log_every=args.log_every,
             lr=args.lr, accum_steps=args.grad_accum)
         with torch.no_grad():
@@ -673,11 +709,16 @@ def main(args):
         # is the scaler backing off, which precedes the zero-gradient collapse; both are
         # invisible in the loss, which stays finite throughout.
         if use_amp:
+            # Under bf16 there is no scale to report, but the skipped/zero-gradient
+            # counts still matter: they are now the only way a non-finite gradient shows
+            # up at all, since nothing backs off in response to one.
+            scale_note = (f" | scaler scale {train_stats['scale']:g}"
+                          if math.isfinite(train_stats["scale"]) else "")
             log.info("  amp: %d optimizer step(s), %d skipped for non-finite grads "
-                     "(%.1f%%), %d with zero gradient | scaler scale %.0f",
+                     "(%.2f%%), %d with zero gradient%s",
                      train_stats["n_opt_steps"], train_stats["n_skipped_steps"],
                      100.0 * train_stats["n_skipped_steps"] / max(train_stats["n_opt_steps"], 1),
-                     train_stats["n_zero_grad"], train_stats["scale"])
+                     train_stats["n_zero_grad"], scale_note)
         if val_stats["n_nonfinite"]:
             log.warning("  val: %d non-finite batch(es) excluded from val_loss; the "
                         "checkpoint decision below is made on the rest",
@@ -841,7 +882,15 @@ def parse_args():
     g.add_argument("--min_lr_frac", type=float, default=0.0,
                    help="Floor the cosine schedule at this fraction of the peak LR "
                         "instead of decaying to zero. See cosine_with_warmup.")
-    g.add_argument("--fp16", action="store_true")
+    g.add_argument("--fp16", action="store_true",
+                   help="Mixed precision in float16, with a GradScaler. Prefer --bf16: "
+                        "fp16's 65504 ceiling makes the scaler back off, and it only "
+                        "recovers after 2000 consecutive clean steps, so a sustained "
+                        "non-finite rate above 0.05% drives the scale to zero and "
+                        "training silently becomes a no-op.")
+    g.add_argument("--bf16", action="store_true",
+                   help="Mixed precision in bfloat16 (no GradScaler needed). Requires a "
+                        "GPU with bf16 support; Ampere and later, including H100.")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--workers", type=int, default=4)
     g.add_argument("--log_every", type=int, default=100)
