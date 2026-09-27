@@ -32,7 +32,8 @@ from typing import Optional
 from .PositionalEmbeddings import build_positional_embedding
 from .transformer_encoder import TransformerEncoder
 from .transformer_decoder import TransformerDecoder
-from .masks import build_head_mask_bias, parse_mask_spec, spec_can_empty_rows
+from .masks import (MASK_NEG, build_head_mask_bias, parse_mask_spec,
+                    spec_can_empty_rows)
 
 # The decoder must be able to attend only to what it has already produced.
 DECODER_MASK_TYPE = "C"
@@ -197,7 +198,10 @@ class MaskedTransformer(nn.Module):
             Additive bias broadcastable to ``[batch, heads, q_len, k_len]``, or ``None``
             when nothing needs masking at all.
         """
-        neg = torch.finfo(dtype).min
+        # MASK_NEG, not finfo(dtype).min: in fp16 the dtype minimum is -65504, so adding
+        # it to an attention logit more than ~16 below zero overflows to -inf. See the
+        # note on MASK_NEG in masks.py.
+        neg = MASK_NEG
         bias = None
         n_terms = 0
 
@@ -226,11 +230,12 @@ class MaskedTransformer(nn.Module):
             n_terms += 1
 
         if n_terms > 1:
-            # Two finite minima can sum below the dtype's range and become -inf, which
-            # would reintroduce the NaN that finite masking exists to avoid. Only a sum
-            # can underflow, so clamping a lone term would buy nothing and cost a full
-            # copy of a tensor that is 1.07 GB at [1, 8, 8192, 8192] in fp16 -- on every
-            # forward pass, defeating the mask cache entirely.
+            # Two sentinels sum to 2 * MASK_NEG, which is still finite and still masks
+            # completely, but the clamp keeps the bias on one known value so that
+            # downstream checks (and the fully-masked-row test below) have a single
+            # threshold to compare against. Only a sum can exceed the sentinel, so
+            # clamping a lone term would buy nothing and cost a full copy of a tensor
+            # that is 1.07 GB at [1, 8, 8192, 8192] in fp16, on every forward pass.
             bias = bias.clamp_min(neg)
 
         # Rows with nothing left to attend to are neutralised, not merely made finite.

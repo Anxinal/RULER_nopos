@@ -281,6 +281,21 @@ LOSS_SPIKE_FACTOR = 3.0
 # is invisible and one catastrophic batch keeps it pinned high for the rest of the epoch.
 RECENT_WINDOW = 200
 
+# Consecutive zero-gradient optimizer steps tolerated before the run is declared dead.
+#
+# Under AMP this is the terminal state of a diverged run, and it is silent: the loss is
+# still finite (so the non-finite guard never fires), but the gradient scaler has backed
+# off so far that fp16 gradients underflow to zero in backward. unscale_ then turns zero
+# into zero, no inf is found, and scaler.step applies a ZERO update -- forever. Observed
+# in practice as `gnorm 0.00` for thousands of batches at loss ~17, burning GPU on a
+# model that cannot move. GradScaler only retries growing the scale every 2000 steps, so
+# waiting it out is not a strategy either.
+#
+# 50 steps is comfortably more than any transient: a healthy run never produces two in a
+# row, because a zero gradient over a whole accumulation group means every micro-batch
+# underflowed.
+MAX_ZERO_GRAD_STEPS = 50
+
 
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
               scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
@@ -313,8 +328,11 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
 
     recent = collections.deque(maxlen=RECENT_WINDOW)   # (loss, n_tok) per finite batch
     stats = dict(n_nonfinite=0, n_spikes=0, max_loss=float("-inf"),
-                 first_nonfinite_step=None, last_grad_norm=float("nan"))
+                 first_nonfinite_step=None, last_grad_norm=float("nan"),
+                 n_opt_steps=0, n_skipped_steps=0, n_zero_grad=0,
+                 scale=float("nan"))
     grad_norm = float("nan")
+    zero_grad_streak = 0
 
     if is_train:
         optimizer.zero_grad(set_to_none=True)
@@ -380,13 +398,46 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                 if scaler:
                     scaler.unscale_(optimizer)
                     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    # GradScaler halves its scale exactly when unscale_ found a non-finite
+                    # gradient, and that is also when it skips the step -- so comparing the
+                    # scale across update() is how a skipped step is detected without
+                    # touching private attributes.
+                    scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    stats["scale"] = scaler.get_scale()
+                    if stats["scale"] < scale_before:
+                        stats["n_skipped_steps"] += 1
                 else:
                     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
                 grad_norm = float(grad_norm)
                 stats["last_grad_norm"] = grad_norm
+                stats["n_opt_steps"] += 1
+
+                # A zero gradient over an entire accumulation group is not a small
+                # gradient, it is arithmetic that produced nothing -- see
+                # MAX_ZERO_GRAD_STEPS. Fail here rather than let the job run to its time
+                # limit applying zero updates.
+                if grad_norm == 0.0:
+                    stats["n_zero_grad"] += 1
+                    zero_grad_streak += 1
+                    if zero_grad_streak == 1:
+                        log.warning(
+                            "  step %d: gradient norm is exactly 0 (loss %.4f, scaler "
+                            "scale %s). If this persists the scaler has collapsed and no "
+                            "learning is happening.", step, loss_val, stats["scale"])
+                    if zero_grad_streak >= MAX_ZERO_GRAD_STEPS:
+                        raise RuntimeError(
+                            f"{zero_grad_streak} consecutive optimizer steps had a "
+                            f"gradient norm of exactly 0 while the loss was "
+                            f"{loss_val:.4f} (scaler scale {stats['scale']}). The "
+                            f"gradient scaler has backed off far enough that gradients "
+                            f"underflow to zero, so every step is a no-op. Training "
+                            f"cannot recover; stopping instead of burning the time limit."
+                        )
+                else:
+                    zero_grad_streak = 0
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler:
                     scheduler.step()
@@ -405,7 +456,12 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                     "gnorm %.2f | lr %.2e%s",
                     step, n_batches, avg, len(recent), win, math.exp(min(win, 20)),
                     grad_norm, cur_lr,
-                    f" | SKIPPED {stats['n_nonfinite']} non-finite" if stats["n_nonfinite"] else "",
+                    (f" | scale {stats['scale']:.0f}"
+                     if use_amp and math.isfinite(stats["scale"]) else "")
+                    + (f" | {stats['n_skipped_steps']} step(s) skipped"
+                       if stats["n_skipped_steps"] else "")
+                    + (f" | SKIPPED {stats['n_nonfinite']} non-finite batch(es)"
+                       if stats["n_nonfinite"] else ""),
                 )
 
     if total_tokens == 0:
@@ -613,6 +669,15 @@ def main(args):
                  train_stats["n_spikes"], train_stats["n_nonfinite"],
                  f" (first at step {train_stats['first_nonfinite_step']})"
                  if train_stats["n_nonfinite"] else "")
+        # AMP health, separate from loss health. A rising skip count with a falling scale
+        # is the scaler backing off, which precedes the zero-gradient collapse; both are
+        # invisible in the loss, which stays finite throughout.
+        if use_amp:
+            log.info("  amp: %d optimizer step(s), %d skipped for non-finite grads "
+                     "(%.1f%%), %d with zero gradient | scaler scale %.0f",
+                     train_stats["n_opt_steps"], train_stats["n_skipped_steps"],
+                     100.0 * train_stats["n_skipped_steps"] / max(train_stats["n_opt_steps"], 1),
+                     train_stats["n_zero_grad"], train_stats["scale"])
         if val_stats["n_nonfinite"]:
             log.warning("  val: %d non-finite batch(es) excluded from val_loss; the "
                         "checkpoint decision below is made on the rest",
@@ -661,7 +726,11 @@ def main(args):
                                     train_max_batch_loss=train_stats["max_loss"],
                                     train_spikes=train_stats["n_spikes"],
                                     train_nonfinite=train_stats["n_nonfinite"],
-                                    val_nonfinite=val_stats["n_nonfinite"])) + "\n")
+                                    val_nonfinite=val_stats["n_nonfinite"],
+                                    opt_steps=train_stats["n_opt_steps"],
+                                    skipped_steps=train_stats["n_skipped_steps"],
+                                    zero_grad_steps=train_stats["n_zero_grad"],
+                                    scaler_scale=train_stats["scale"])) + "\n")
 
         if args.early_stop_patience > 0 and stale >= args.early_stop_patience:
             # The floor exists because "flat" does not always mean "finished". An arm

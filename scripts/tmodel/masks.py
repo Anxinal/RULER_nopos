@@ -32,6 +32,30 @@ SOFT_MASK_CAP_DEFAULT = 12.0
 # of ALiBi's eight-head schedule (0.5 ... 0.0039) already used in this repo.
 SOFT_MASK_TAU_DEFAULT = 64.0
 
+# Value written at masked positions, in place of -inf OR the dtype minimum.
+#
+# It has to satisfy two things at once, and torch.finfo(dtype).min satisfies only the
+# first:
+#
+#   1. exp(MASK_NEG - row_max) must underflow to exactly 0, or masking leaks. At -1e4
+#      that holds in fp16, bf16 and fp32 alike -- fp32 exp() already underflows below
+#      about -104.
+#   2. MASK_NEG + logit must stay INSIDE the dtype's range. fp16 saturates at 65504, so
+#      finfo(float16).min = -65504 overflows to -inf as soon as an attention logit is
+#      more than ~16 below zero at a masked position. -1e4 leaves 6x headroom.
+#
+# Why that second point matters here: the masked arms (C / F / CCCCFFFF) carry this value
+# across roughly half of every [L, L] score matrix -- ~2M entries per head at L=2048 --
+# while the bidirectional arm carries it only in padded key columns, a few dozen columns.
+# So the masked arms have millions of chances per batch to overflow where BBBBBBBB has
+# thousands, and in practice every masked arm collapsed in fp16 within ~6 epochs while
+# BBBBBBBB trained cleanly past 15. That is the one structural difference between them.
+#
+# Trading the dtype minimum for a bounded sentinel costs nothing measurable: exp() gives
+# 0 either way, so the attention weights are identical, and the tensor no longer sits at
+# the edge of the representable range where a single addition leaves it.
+MASK_NEG = -1e4
+
 
 
 
@@ -243,13 +267,13 @@ def build_additive_mask(mask_type: str, dim: int, device, dtype, *,
     * **Cached.** Building the tensor fresh on every forward pass costs a 268 MB
       allocation at ``dim=8192``. The cache is keyed on shape, device and dtype, and
       the number of distinct keys is bounded by the experiment grid.
-    * **Finite.** Masked positions hold ``torch.finfo(dtype).min`` rather than ``-inf``.
-      A row that ends up fully masked -- which happens with the future-only mask when a
-      padded query position can only see later positions that are themselves padding --
-      would otherwise softmax to NaN. A NaN at a padded position is not harmless: the
-      decoder's cross-attention multiplies it by a zero weight, and ``0 * NaN`` is NaN,
-      so it would propagate into real positions. Finite values soften such a row to a
-      uniform distribution instead, and its output is discarded downstream anyway.
+    * **Finite and bounded.** Masked positions hold :data:`MASK_NEG` rather than ``-inf``
+      or the dtype minimum. Finiteness stops a fully masked row -- which happens with the
+      future-only mask when a padded query can only see later positions that are
+      themselves padding -- from softmaxing to NaN; such a NaN is not harmless, because
+      the decoder's cross-attention multiplies it by a zero weight and ``0 * NaN`` is
+      NaN, so it reaches real positions. Boundedness stops ``MASK_NEG + logit`` from
+      overflowing fp16, which the dtype minimum does not. See :data:`MASK_NEG`.
       ``"S"`` never needs this: its penalty is bounded by ``soft_cap``, so no row can be
       fully masked and the post-processing below is a no-op on it.
 
@@ -291,9 +315,11 @@ def build_additive_mask(mask_type: str, dim: int, device, dtype, *,
         tensor = mask_cls(dim, cap=soft_cap, tau=soft_tau).tensor
     else:
         tensor = mask_cls(dim).tensor  # float32, -inf in masked positions
-    neg = torch.finfo(dtype).min
-    tensor = torch.nan_to_num(tensor, neginf=neg).to(device=device, dtype=dtype)
-    tensor = tensor.clamp_min(neg)
+    # MASK_NEG, not finfo(dtype).min -- see the note on MASK_NEG. nan_to_num replaces the
+    # -inf the Mask subclasses produce; the clamp then catches anything the soft mask or a
+    # future subclass might put below the sentinel.
+    tensor = torch.nan_to_num(tensor, neginf=MASK_NEG).to(device=device, dtype=dtype)
+    tensor = tensor.clamp_min(MASK_NEG)
 
     _MASK_CACHE[key] = tensor
     return tensor
