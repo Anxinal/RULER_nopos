@@ -131,8 +131,30 @@ EVAL_SEED=62                # RULER default
 EPOCHS=30
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
-LR=3e-4                     # the --sanity control that passes uses 3e-4
-WARMUP=1000
+# 3e-4 -> 2e-4. At 3e-4 every arm diverged smoothly from the second epoch onward: the
+# windowed loss climbed 7.2 -> 15.8 over 2000 batches, past the uniform baseline
+# ln(50258) = 10.8, which is a model being driven to confident wrong answers rather than
+# one failing to learn. It began exactly where warmup ends and the schedule reaches peak.
+#
+# 2e-4 is not a guess: it is the LR of the only cell that has ever solved this task
+# (pe_none_encCCCCFFFF, best_val_loss 0.042), at the same 8 layers and the same
+# grad_clip. The 3e-4 came from the --sanity control, which is d_model=256, 4 layers at
+# 512 tokens -- a far more LR-tolerant configuration than 8 layers at 2048.
+#
+# Corroborating signal in the same log: gnorm sat at 2.4-4.3 against grad_clip=1.0, and
+# clip_grad_norm_ reports the norm BEFORE clipping, so every step was being scaled down
+# 2.5-4x. Persistent clipping at that ratio means the step size is mismatched, not that
+# the occasional batch is unusual.
+LR=2e-4
+# 1000 -> 3000. WARMUP is an absolute optimizer-step count, so it silently shrank as a
+# FRACTION of training when the suite grew: 3 tasks over 25 epochs was 26,367 steps and
+# 1000 warmup steps was 3.8% of it, while 7 tasks over 30 epochs is 73,830 steps and the
+# same 1000 is 1.35%. The model was arriving at peak LR three times sooner in relative
+# terms than in the run that worked. 3000 restores roughly the old share (~4%).
+#
+# Note train.py caps this at total_steps/10, so it cannot exceed a tenth of the run
+# however large it is set here.
+WARMUP=3000
 # Early stopping. EPOCHS is a cap, not a target: a cell stops once val loss has failed
 # to beat its running best by MIN_DELTA for PATIENCE consecutive epochs.
 #
