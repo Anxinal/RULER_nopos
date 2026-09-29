@@ -6,3 +6,4 @@ __pycache__/
 
 # Experiment outputs: checkpoints, generated data, SLURM logs
 experiments/
+wandb/

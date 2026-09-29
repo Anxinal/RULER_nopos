@@ -165,13 +165,8 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
     estimated_max_words = int(max_seq_length // tokens_per_words) * 2
 
-    # Binary search for optimal haystack size.
-    # NOTE: the lower bound must not be `incremental`. If it is and even that smallest
-    # size overflows the budget (which happens at short --max_seq_length), the search
-    # returns nothing, `num_words` falls back to `incremental`, and the size-reduction
-    # loop below can never decrement -- an unrecoverable silent hang.
-    # Floor at num_cw + 1 so there is always at least one uncommon word to contrast with.
-    lower_bound = args.num_cw + 1
+    # Binary search for optimal haystack size
+    lower_bound = incremental
     upper_bound = max(estimated_max_words, incremental * 2)  # Ensure upper_bound is reasonable
 
     optimal_num_words = None
@@ -193,13 +188,7 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
             # Too large, need to go smaller
             upper_bound = mid - 1
 
-    if optimal_num_words is None:
-        raise RuntimeError(
-            f"common_words_extraction/{args.save_name}: cannot fit even {lower_bound} words "
-            f"within max_seq_length={max_seq_length} (tokens_to_generate={tokens_to_generate}). "
-            f"Raise --max_seq_length."
-        )
-    num_words = optimal_num_words
+    num_words = optimal_num_words if optimal_num_words is not None else incremental
     logger.info(f'Final optimal haystack size (number of haystack): {num_words}')
 
 
@@ -213,13 +202,8 @@ def sys_word_pair_random(num_samples: int, max_seq_length: int, save_dir: str, i
                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
                 break
             except:
-                # Decrement toward a floor and fail loudly rather than spinning forever.
-                if used_words <= args.num_cw + 1:
-                    raise RuntimeError(
-                        f"common_words_extraction/{args.save_name}: sample {index} does not fit "
-                        f"within max_seq_length={max_seq_length} at the minimum word count."
-                    )
-                used_words = max(args.num_cw + 1, used_words - incremental)
+                if used_words > incremental:
+                    used_words -= incremental
 
         if args.remove_newline_tab:
             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())

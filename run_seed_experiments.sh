@@ -1,25 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# run_experiments.sh
+# run_seed_experiments.sh
 #
-# End-to-end experiment runner for MaskedTransformer on the RULER benchmark.
+# Seed sweep on the RULER benchmark: every arm below is trained and evaluated with
+# each of SEEDS, one Slurm job per (arm, seed).
 #
-# Pipeline (per configuration):
-#   1. Generate RULER training data   (data/prepare.py, seed=0)
-#   2. Train MaskedTransformer        (tmodel/train.py)
-#   3. Generate RULER eval data       (data/prepare.py, seed=42)
-#   4. Run predictions                (pred/call_api.py --server_type tmodel)
-#   5. Compute metrics                (eval/evaluate.py)
+# Arms (10):
+#   transformer_mask (maskedVanilla, encoder-decoder), pe x encoder mask:
+#       pe   in {none, sinusoidal}
+#       mask in {CCCCFFFF, BBBBBBBB, CCCCCCCC, CCCCCCFF}
+#   roformer  (decoder-only, RoPE)
+#   alibi     (decoder-only, ALiBi)
+# Every model uses its library's default hyperparameters (see tmodel/models.py).
+#
+# Pipeline (per arm and seed):
+#   1. Generate RULER training data   (scripts/data/prepare.py, once, shared)
+#   2. Train with wandb tracking       (train_wandb.py -> train.py)
+#   3. Generate RULER eval data       (scripts/data/prepare.py, once, shared)
+#   4. Run predictions                (scripts/pred/call_api.py --server_type tmodel)
+#   5. Compute metrics                (scripts/eval/evaluate.py)
 #
 # Modes
 # -----
-#   bash run_experiments.sh              # submit to SLURM
-#   bash run_experiments.sh --dry-run    # print commands only
-#   bash run_experiments.sh --local      # run sequentially, no SLURM
-#   bash run_experiments.sh --summary    # collect results into CSV
+#   bash run_seed_experiments.sh              # submit to SLURM
+#   bash run_seed_experiments.sh --dry-run    # print each job's training command
+#   bash run_seed_experiments.sh --local      # run sequentially, no SLURM
+#   bash run_seed_experiments.sh --summary    # collect results into CSV
+#
+# wandb: jobs need credentials on the compute nodes -- `wandb login` on a shared home
+# (writes ~/.netrc) or WANDB_API_KEY exported when submitting (sbatch passes the
+# environment through). Set WANDB_MODE=offline to log locally and `wandb sync` later.
 # =============================================================================
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The pipeline scripts (data/, pred/, eval/, config_tasks.sh, synthetic.yaml) live in
+# scripts/; every path below is relative to it, as in scripts/run_experiments.sh.
+SCRIPT_DIR="${REPO_DIR}/scripts"
 
 # ====================== CLUSTER (edit for your site) =========================
 PARTITION="${PARTITION:-gpu}"
@@ -64,29 +80,10 @@ PIP_ARGS="${PIP_ARGS:-}"
 TORCH_SPEC="${TORCH_SPEC:-}"
 
 # ====================== MODEL ================================================
-# 286M -> ~70M. Capacity was never the binding constraint: the arm that works reached
-# 98 at the larger size, and a <1M-parameter reproduction of the same task structure
-# reached 83-100%. Excess capacity actively works against us here -- 286M parameters
-# against 67.5k unique samples is heavy pressure to memorise the answer FORMAT, which
-# is precisely the basin every failing cell settled into (ppl ~49, 3-6 distinct outputs
-# for 1000 questions). Less room to memorise biases toward the general solution, and
-# ~4x cheaper cells make the remaining open questions answerable in hours not days.
-#
-# NUM_HEADS stays 8: the mask specs are one code per head, and CCCCFFFF's 4-causal /
-# 4-future split is the object under study. head_dim is 512/8 = 64, the usual value.
-D_MODEL=512
-NUM_HEADS=8
-NUM_LAYERS=8
-D_FF=2048
-# 0.0, not 0.2. embed_dropout is applied to the SUM of the token embedding and the
-# additive positional encoding, so for the sinusoidal arms it randomly deletes 20% of a
-# vector in which content and position are already entangled -- a penalty RoPE and ALiBi
-# never pay, since their positional signal lives in the attention scores and is never
-# dropped. Both configurations known to learn this task (the --sanity control, and the
-# small-scale reproduction) ran at 0.0. Raise it only if val loss starts diverging from
-# train; with random per-sample needles there is little here to overfit.
-DROPOUT=0.0
-MAX_LEN=16384     # PE buffer length (must be >= longest EVAL seq length)
+# No size settings: every model uses its library's default hyperparameters
+# (nn.Transformer, RoFormerConfig, ALiBiConfig). transformer_mask has 8 heads, so each
+# mask spec below is one code per head. MAX_LEN is set after the data section.
+TM_NUM_HEADS=8
 TOKENIZER="gpt2"
 
 # ====================== DATA =================================================
@@ -131,50 +128,11 @@ EVAL_SEED=62                # RULER default
 EPOCHS=30
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
-# 3e-4 -> 2e-4. At 3e-4 every arm diverged smoothly from the second epoch onward: the
-# windowed loss climbed 7.2 -> 15.8 over 2000 batches, past the uniform baseline
-# ln(50258) = 10.8, which is a model being driven to confident wrong answers rather than
-# one failing to learn. It began exactly where warmup ends and the schedule reaches peak.
-#
-# 2e-4 is not a guess: it is the LR of the only cell that has ever solved this task
-# (pe_none_encCCCCFFFF, best_val_loss 0.042), at the same 8 layers and the same
-# grad_clip. The 3e-4 came from the --sanity control, which is d_model=256, 4 layers at
-# 512 tokens -- a far more LR-tolerant configuration than 8 layers at 2048.
-#
-# Corroborating signal in the same log: gnorm sat at 2.4-4.3 against grad_clip=1.0, and
-# clip_grad_norm_ reports the norm BEFORE clipping, so every step was being scaled down
-# 2.5-4x. Persistent clipping at that ratio means the step size is mismatched, not that
-# the occasional batch is unusual.
+
 LR=2e-4
-# 1000 -> 3000. WARMUP is an absolute optimizer-step count, so it silently shrank as a
-# FRACTION of training when the suite grew: 3 tasks over 25 epochs was 26,367 steps and
-# 1000 warmup steps was 3.8% of it, while 7 tasks over 30 epochs is 73,830 steps and the
-# same 1000 is 1.35%. The model was arriving at peak LR three times sooner in relative
-# terms than in the run that worked. 3000 restores roughly the old share (~4%).
-#
-# Note train.py caps this at total_steps/10, so it cannot exceed a tenth of the run
-# however large it is set here.
+
 WARMUP=3000
-# Early stopping. EPOCHS is a cap, not a target: a cell stops once val loss has failed
-# to beat its running best by MIN_DELTA for PATIENCE consecutive epochs.
-#
-# Note MIN_DELTA is measured against the running BEST, not the previous epoch, so the
-# bar ratchets upward. An epoch can write a new best.pt and still increment the stale
-# counter, if it improved by less than MIN_DELTA.
-#
-# These gate on pooled val loss, which is exactly the quantity the degenerate solution
-# already optimises: a model that memorises the answer FORMAT and ignores the context
-# settles at ppl ~49 and sits there, val loss flattens, and patience expires while the
-# retrieval circuit has not begun to form. The previous settings certified that basin as
-# "converged" at epoch 17 in every failing cell. The real remedy is MIN_LR_FRAC below --
-# those cells were at 5e-5 by the time they stopped, far too small to escape.
-#
-# MIN_EPOCHS only suppresses the break; the stale counter keeps climbing underneath it.
-# So an arm that plateaus early stops at exactly MIN_EPOCHS, not MIN_EPOCHS + PATIENCE.
-# The floor only bites when MIN_EPOCHS > PATIENCE -- otherwise reaching stale >= PATIENCE
-# already implies that many epochs have elapsed and patience alone governs. At 12 and 8
-# the floor is live: a cell flat from the start burns patience at epoch 8 and is then
-# held to epoch 12 before it may stop.
+
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
 EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
@@ -183,121 +141,76 @@ EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
 # a step size large enough to explore. The arm that solved the task escaped at epoch 8
 # with LR near peak; failing arms were at 5e-5 by the time they stopped.
 MIN_LR_FRAC="${MIN_LR_FRAC:-0.25}"
-# Mixed-precision dtype: bf16 or fp16.
-#
-# bf16. fp16's ceiling is 65504, and an fp16 run needs a GradScaler, which halves its
-# scale on ANY non-finite gradient but only grows back after 2000 CONSECUTIVE clean
-# steps. So a sustained non-finite rate above 1/2000 = 0.05% drives the scale
-# monotonically to zero, and once it is below 1 the gradients underflow and every
-# optimizer step becomes a no-op while the loss stays finite -- invisible without the
-# per-epoch `amp:` line. Measured here: 4 skipped steps per epoch (0.14%) took the scale
-# from 65536 to below 1 in four epochs and destroyed a run that had reached ppl 1.7.
-#
-# bf16 carries fp32's exponent range, so it needs no scaler and nothing can collapse.
-# H100 supports it natively, at no throughput cost. train.py refuses --bf16 on a GPU
-# without support rather than falling back silently.
+
 PRECISION="${PRECISION:-bf16}"
 SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
-SEED=42
+# Seeds for the sweep; each arm is trained and evaluated once per seed.
+# Override with e.g. SEEDS="1 2 3".
+read -r -a SEEDS <<< "${SEEDS:-42 43 44}"
+# Longest prompt + answer the decoder-only models must accept: prompts go up to the
+# longest EVAL length, so the default (SRC_LEN + TGT_LEN) would truncate them at 4096 and
+# 8192. Note the ALiBi model keeps a MAX_LEN x MAX_LEN causal mask per layer (~1.7 GB over
+# its 6 layers at 8320, in memory and in best.pt). transformer_mask has no length limit.
+MAX_LEN=$(( $(printf '%s\n' "${EVAL_SEQ_LENGTHS[@]}" | sort -n | tail -1) + TGT_LEN ))
+
+# ====================== WANDB ================================================
+WANDB_PROJECT="${WANDB_PROJECT:-Ruler_nopos}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"                 # empty: your default entity
+WANDB_GROUP="${WANDB_GROUP:-seed_sweep}"         # one group per sweep in the UI
+WANDB_MODE="${WANDB_MODE:-online}"               # online | offline | disabled
 
 # ====================== FLAGS ================================================
-# Parsed before the grid is built, so --sanity can override the configuration above
-# before it is validated.
 DRY_RUN=false
 LOCAL=false
 SUMMARY=false
-SANITY=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --local)   LOCAL=true ;;
         --summary) SUMMARY=true ;;
-        --sanity)  SANITY=true ;;
+        *) echo "ERROR: unknown argument '$arg' (expected --dry-run, --local or --summary)." >&2
+           exit 1 ;;
     esac
 done
 
 # ====================== EXPERIMENT GRID ======================================
-# Per-head encoder mask specs: one code per attention head (B/C/F), so each entry
-# must be exactly NUM_HEADS characters long. Head order carries no meaning -- heads
-# are concatenated and mixed by one output projection, so only the count of each
-# code matters. The decoder is always causal and is not an axis of this grid.
-MASK_CONFIGS=("BBBBBBBB" "CCCCCCCC" "CCCCFFFF")
+# transformer_mask arms: every pe crossed with every encoder mask spec (one code per
+# head, B/C/F; head order carries no meaning, only the count of each code). The decoder
+# is always causal. roformer and alibi carry their own position encoding and no mask.
+TM_PES=("none" "sinusoidal")
+TM_MASKS=("CCCCFFFF" "BBBBBBBB" "CCCCCCCC" "CCCCCCFF")
+OTHER_MODELS=("roformer" "alibi")
 
-# The all-bidirectional spec is the "no mask" condition: every head attends
-# everywhere, so position can only come from the encoding.
-NO_MASK_SPEC="BBBBBBBB"
-
-# This is NOT a full cross, deliberately. A cell with both a mask and a positional
-# encoding confounds the two sources of position, and the question is which one
-# supplies it. So:
-#
-
-PE_CROSSED_WITH_MASKS=("none" "sinusoidal")
-# "learned" is dropped. train.py still implements it; it is simply not an arm here.
-PE_NO_MASK_ONLY=("rope" "alibi")
-
-# ====================== SANITY MODE ==========================================
-# A positive control. One task, short context, small model, evaluated at the length
-# it trained on, with a score it must beat.
-#
-# This exists because a null result is uninterpretable without one. Three separate
-# defects -- an initialisation that started the loss near 1000, a target tokenisation
-# that made the answer uncopyable, and training on one of ten answers -- all produced
-# the same signal: zeros in every cell. None was distinguishable from "masks cannot
-# substitute for positional encodings", which is the thing the grid is meant to
-# measure. Run this before spending GPU-days on the grid.
-SANITY_MIN_SCORE="${SANITY_MIN_SCORE:-40}"
-
-if $SANITY; then
-    echo "=== SANITY MODE: positive control, not an experiment ==="
-    SANITY_TASKS=("niah_single_1")     # single needle, noise haystack, no corpus needed
-    TRAIN_SEQ_LENGTHS=(512)
-    EVAL_SEQ_LENGTHS=(512)             # in-distribution on purpose
-    TRAIN_SAMPLES="${SANITY_TRAIN_SAMPLES:-4000}"
-    EVAL_SAMPLES="${SANITY_EVAL_SAMPLES:-200}"
-
-    D_MODEL=256; NUM_HEADS=4; NUM_LAYERS=4; D_FF=1024; DROPOUT=0.0
-    MAX_LEN=1024; SRC_LEN=512; TGT_LEN=32
-
-    EPOCHS="${SANITY_EPOCHS:-30}"; BATCH_SIZE=16; GRAD_ACCUM=1
-    LR=3e-4; WARMUP=200
-    KEEP_CHECKPOINTS=true              # keep it, so a failure can be inspected
-
-    # ALiBi with no mask: the arm the full grid showed to be strongest -- 99+ on every
-    # task at every length, 4x extrapolation included. A positive control has to be the
-    # configuration most likely to succeed, so that failing it means the pipeline is
-    # broken rather than that a weak arm is weak. This was sinusoidal + causal, on the
-    # guess that it would be easiest; the grid refuted that (0.0 in all nine sinusoidal
-    # cells), and it scored 13.5 here once eval stopped overlapping the training data.
-    SANITY_SPEC="$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))"
-    MASK_CONFIGS=("${SANITY_SPEC}")     # validated only; no arm crosses it with a PE
-    NO_MASK_SPEC="${SANITY_SPEC}"
-    PE_CROSSED_WITH_MASKS=()
-    PE_NO_MASK_ONLY=("alibi")
-fi
-
-
-for spec in "${MASK_CONFIGS[@]}"; do
-    if [ ${#spec} -ne "${NUM_HEADS}" ]; then
-        echo "ERROR: mask spec '${spec}' has ${#spec} codes but NUM_HEADS=${NUM_HEADS}." >&2
+for spec in "${TM_MASKS[@]}"; do
+    if [ ${#spec} -ne "${TM_NUM_HEADS}" ]; then
+        echo "ERROR: mask spec '${spec}' has ${#spec} codes but transformer_mask has ${TM_NUM_HEADS} heads." >&2
         exit 1
     fi
 done
-if [ "${NO_MASK_SPEC}" != "$(printf 'B%.0s' $(seq 1 "${NUM_HEADS}"))" ]; then
-    echo "ERROR: NO_MASK_SPEC='${NO_MASK_SPEC}' is not all-bidirectional for NUM_HEADS=${NUM_HEADS}." >&2
-    exit 1
-fi
 
-# Flatten the grid into explicit "<pe> <mask_spec>" cells.
+# Run directory / wandb run name for one cell. "-" marks a field the model does not use.
+exp_name() {
+    local model="$1" pe="$2" enc_mask="$3" seed="$4"
+    if [ "${model}" = "transformer_mask" ]; then
+        echo "transformer_mask_pe${pe}_enc${enc_mask}_s${seed}"
+    else
+        echo "${model}_s${seed}"
+    fi
+}
+
+# Flatten into explicit "<model> <pe> <mask> <seed>" cells. Seeds are the OUTER loop, so
+# the queue holds one complete replicate of every arm before the next seed starts.
 EXPERIMENTS=()
-for pe in ${PE_CROSSED_WITH_MASKS[@]+"${PE_CROSSED_WITH_MASKS[@]}"}; do
-    for spec in "${MASK_CONFIGS[@]}"; do
-        EXPERIMENTS+=("${pe} ${spec}")
+for seed in "${SEEDS[@]}"; do
+    for pe in "${TM_PES[@]}"; do
+        for spec in "${TM_MASKS[@]}"; do
+            EXPERIMENTS+=("transformer_mask ${pe} ${spec} ${seed}")
+        done
     done
-done
-for pe in ${PE_NO_MASK_ONLY[@]+"${PE_NO_MASK_ONLY[@]}"}; do
-    EXPERIMENTS+=("${pe} ${NO_MASK_SPEC}")
+    for model in "${OTHER_MODELS[@]}"; do
+        EXPERIMENTS+=("${model} - - ${seed}")
+    done
 done
 
 # Task list (must match entries in synthetic.yaml)
@@ -390,23 +303,12 @@ source "${SCRIPT_DIR}/config_tasks.sh"
 # always the corpus prefix, so evaluating at 8192 shows text never seen at 2048. That is
 # an evaluation-side confound, and it simply does not arise for a task that is only ever
 # trained at 2048. The train-only slot is where tasks with eval-side confounds belong.
-#
-# ALL_TASKS is the union, and exists only for the two things that need a task's data or
-# corpus regardless of which side it sits on: the yaml check and fetch_corpora.
-if $SANITY; then
-    # Applied here, not in the sanity block above, because this line would otherwise
-    # overwrite it -- config_tasks.sh is sourced after the grid is configured. The
-    # positive control trains and evaluates on the same single task: it exists to prove
-    # the pipeline can learn at all, so holding anything out would only add a way for it
-    # to fail that says nothing about the pipeline.
-    TRAIN_TASKS=("${SANITY_TASKS[@]}")
-    EVAL_TASKS=("${SANITY_TASKS[@]}")
-else
-    TRAIN_TASKS=("niah_single_1" "niah_single_3" "vt" "vt_2chain"
-                 "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
-    EVAL_TASKS=("vt_2chain" "vt_4chain"
-                "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
-fi
+
+
+TRAIN_TASKS=("niah_single_1" "niah_single_3" "vt" "vt_2chain"
+             "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
+EVAL_TASKS=("vt_2chain" "vt_4chain"
+            "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
 
 # Union, order preserving. Nothing outside this loop should iterate both lists.
 ALL_TASKS=()
@@ -450,7 +352,7 @@ echo "  eval only (held out): ${_eval_only[*]:-none}"
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
 LOG_DIR="${EXP_ROOT}/slurm_logs"
-TRAIN_SCRIPT="${SCRIPT_DIR}/../train.py"
+TRAIN_SCRIPT="${REPO_DIR}/train_wandb.py"
 
 # ====================== SUMMARY MODE =========================================
 if $SUMMARY; then
@@ -458,20 +360,27 @@ if $SUMMARY; then
     # empty prediction and a confidently wrong one both score 0.0, and only the null
     # count separates "the model emitted nothing" from "the model emitted the wrong
     # thing". Those two have completely different causes.
-    echo "pe_type,encoder_mask,seq_length,task,score,nulls"
-    for dir in "${EXP_ROOT}"/results/pe_*/synthetic/*/pred; do
+    echo "model,pe,encoder_mask,seed,seq_length,task,score,nulls"
+    # Only this sweep's runs: their directory names end in _s<seed> (see exp_name);
+    # scripts/run_experiments.sh's pe_* results in the same tree are skipped.
+    for dir in "${EXP_ROOT}"/results/*_s[0-9]*/synthetic/*/pred; do
         [ -f "${dir}/summary.csv" ] || continue
-        # Parse path: .../pe_<PE>_enc<SPEC>/synthetic/<SEQ>/pred/summary.csv
+        # Parse path: .../<exp_name>/synthetic/<SEQ>/pred/summary.csv
         # Shell parameter expansion only -- `grep -oP` is GNU-specific and is not
         # available in the BSD grep shipped with macOS.
         seq_dir="${dir%/pred}"          # .../synthetic/<SEQ>
         seq="${seq_dir##*/}"            # <SEQ>
         cfg_dir="${seq_dir%/*}"         # .../synthetic
-        cfg_dir="${cfg_dir%/*}"         # .../pe_<PE>_enc<SPEC>
-        cfg="${cfg_dir##*/}"            # pe_<PE>_enc<SPEC>
-        rest="${cfg#pe_}"               # <PE>_enc<SPEC>
-        pe="${rest%_enc*}"              # <PE>
-        enc="${rest##*_enc}"            # <SPEC>
+        cfg_dir="${cfg_dir%/*}"         # .../<exp_name>
+        cfg="${cfg_dir##*/}"            # e.g. transformer_mask_pesinusoidal_encCCCCFFFF_s42
+        seed="${cfg##*_s}"
+        base="${cfg%_s*}"
+        case "${base}" in
+            transformer_mask_pe*)
+                rest="${base#transformer_mask_pe}"   # <PE>_enc<SPEC>
+                model="transformer_mask"; pe="${rest%%_enc*}"; enc="${rest##*_enc}" ;;
+            *)  model="${base}"; pe="-"; enc="-" ;;
+        esac
         # summary.csv is a transposed frame written by eval/evaluate.py, so its first
         # line is pandas' integer column header and the task names are on line 2:
         #   0,1,2,...
@@ -490,7 +399,7 @@ if not tasks:
     sys.exit(f'malformed summary: ${dir}/summary.csv')
 nulls += [''] * (len(tasks) - len(nulls))
 for t, s, n in zip(tasks, scores, nulls):
-    print(f'${pe},${enc},${seq},{t},{s},{n}')
+    print(f'${model},${pe},${enc},${seed},${seq},{t},{s},{n}')
 "
     done
     exit 0
@@ -560,7 +469,8 @@ REQUIRED = {
     "torch": "torch", "transformers": "transformers", "numpy": "numpy",
     "scipy": "scipy", "nltk": "nltk", "wonderwords": "wonderwords",
     "tenacity": "tenacity", "pandas": "pandas", "yaml": "pyyaml",
-    "tqdm": "tqdm", "requests": "requests",
+    "tqdm": "tqdm", "requests": "requests", "wandb": "wandb",
+    "torch_geometric": "torch_geometric",
 }
 print(" ".join(sorted({pip for mod, pip in REQUIRED.items()
                        if importlib.util.find_spec(mod) is None})))
@@ -583,8 +493,8 @@ _pip_install() {
         echo "       Check with:" >&2
         echo "           srun --partition=${PARTITION} --time=00:02:00 python -m pip download --dest /tmp tqdm" >&2
         echo "       If that is the problem, point PIP_ARGS at a reachable source, e.g." >&2
-        echo "           PIP_ARGS='--index-url https://<internal-mirror>/simple' bash run_experiments.sh" >&2
-        echo "           PIP_ARGS='--no-index --find-links \$HOME/wheels' bash run_experiments.sh" >&2
+        echo "           PIP_ARGS='--index-url https://<internal-mirror>/simple' bash run_seed_experiments.sh" >&2
+        echo "           PIP_ARGS='--no-index --find-links \$HOME/wheels' bash run_seed_experiments.sh" >&2
         exit 1
     fi
 }
@@ -616,7 +526,7 @@ check_environment() {
                 echo "       against the wrong CUDA, and that fails silently: training falls" >&2
                 echo "       back to CPU and the sweep takes weeks instead of hours." >&2
                 echo "       Name the wheel this cluster needs and the job will install it:" >&2
-                echo "           TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121' bash run_experiments.sh" >&2
+                echo "           TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121' bash run_seed_experiments.sh" >&2
                 exit 1
             fi
             echo "--- Installing torch from TORCH_SPEC: ${TORCH_SPEC} ---"
@@ -673,7 +583,7 @@ except Exception as exc:
         f"       wheel  : torch {torch.__version__} built for {' '.join(archs)}\n"
         f"       cause  : {type(exc).__name__}: {exc}\n"
         f"       This wheel has no kernels for sm_{major}{minor}. Either pin the job to a\n"
-        f"       GPU type the wheel supports (see GPU_SPEC in run_experiments.sh), or\n"
+        f"       GPU type the wheel supports (see GPU_SPEC in run_seed_experiments.sh), or\n"
         f"       install a matching build, e.g.\n"
         f"           TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121'"
     )
@@ -691,8 +601,8 @@ fetch_corpora() {
     echo "--- Checking source corpora in ${CORPUS_DIR} ---"
 
     # Only fetch what the selected tasks actually read. Most needle tasks use the noise
-    # or needle haystacks and need no corpus at all, so a run restricted to those --
-    # --sanity in particular -- should not pull down three datasets it will never open.
+    # or needle haystacks and need no corpus at all, so a run restricted to those
+    # should not pull down three datasets it will never open.
     # Which tasks use the essay haystack is set in synthetic.yaml (type_haystack: essay).
     # Must track every task with `type_haystack: essay` in synthetic.yaml. niah_single_3
     # was missing here, which went unnoticed only because niah_single_2 was always
@@ -810,48 +720,6 @@ generate_train_data() {
     done
 }
 
-# Pass/fail gate for --sanity. Reads the summary evaluate.py just wrote and compares
-# the score against SANITY_MIN_SCORE, exiting non-zero below it so the failure is
-# visible in the job's exit status rather than only in a log nobody reads.
-assert_sanity_score() {
-    local summary="$1"
-    if [ ! -f "${summary}" ]; then
-        echo "SANITY FAILED: no summary at ${summary}" >&2
-        exit 1
-    fi
-    python - "${summary}" "${SANITY_MIN_SCORE}" <<'PYSANITY'
-import csv, sys
-
-path, threshold = sys.argv[1], float(sys.argv[2])
-rows = [r for r in csv.reader(open(path)) if r]
-by_label = {r[0]: r[1:] for r in rows}
-tasks = by_label.get("Tasks", [])
-scores = by_label.get("Score", [])
-nulls = by_label.get("Nulls", [])
-if not tasks:
-    sys.exit(f"SANITY FAILED: malformed summary {path}")
-
-worst = None
-for i, task in enumerate(tasks):
-    score = float(scores[i])
-    null = nulls[i] if i < len(nulls) else "?"
-    print(f"    {task}: score={score} nulls={null}")
-    if worst is None or score < worst:
-        worst = score
-
-if worst < threshold:
-    sys.exit(
-        f"\nSANITY FAILED: score {worst} is below the {threshold} threshold.\n"
-        f"  A model cannot retrieve a needle from a context length it trained on.\n"
-        f"  Something in the train/predict path is broken; the grid would produce\n"
-        f"  zeros that look like a scientific result. Do not submit it.\n"
-        f"  Check, in order: the copy rate logged by RulerDataset, the initial loss\n"
-        f"  against ln(vocab_size), and whether val loss fell at all."
-    )
-print(f"\n    SANITY PASSED: {worst} >= {threshold}")
-PYSANITY
-}
-
 # Longest answer in a task's eval set, in tokens, plus a small margin. Used to cap
 # generation so a model cannot hedge -- emit several candidate orderings and let the
 # substring metric credit one of them. The margin covers EOS and one stray token; it is
@@ -877,9 +745,50 @@ PYCAP
 }
 
 # ====================== PER-EXPERIMENT JOB ====================================
+# Fills TRAIN_CMD with the training command for one cell. Shared by run_experiment and
+# --dry-run, so what the dry run prints is exactly what a job runs.
+train_command() {
+    local model="$1" pe="$2" enc_mask="$3" seed="$4"
+    local EXP_NAME; EXP_NAME="$(exp_name "${model}" "${pe}" "${enc_mask}" "${seed}")"
+    TRAIN_CMD=(python "${TRAIN_SCRIPT}"
+        --model        "${model}")
+    local tags=("model:${model}" "seed:${seed}")
+    if [ "${model}" = "transformer_mask" ]; then
+        TRAIN_CMD+=(--pe "${pe}" --encoder_mask "${enc_mask}")
+        tags+=("pe:${pe}" "mask:${enc_mask}")
+    fi
+    TRAIN_CMD+=(
+        --max_len      "${MAX_LEN}"
+        --data_format  ruler
+        --data_dir     "${TRAIN_DATA_DIR}"
+        --tokenizer    "${TOKENIZER}"
+        --src_len      "${SRC_LEN}"
+        --tgt_len      "${TGT_LEN}"
+        --epochs       "${EPOCHS}"
+        --batch_size   "${BATCH_SIZE}"
+        --grad_accum   "${GRAD_ACCUM}"
+        --early_stop_patience   "${EARLY_STOP_PATIENCE}"
+        --early_stop_min_delta  "${EARLY_STOP_MIN_DELTA}"
+        --early_stop_min_epochs "${EARLY_STOP_MIN_EPOCHS}"
+        --lr           "${LR}"
+        --warmup_steps "${WARMUP}"
+        --min_lr_frac  "${MIN_LR_FRAC}"
+        --seed         "${seed}"
+        "--${PRECISION}"
+        --output_dir   "${EXP_ROOT}/${EXP_NAME}"
+        --project      "${WANDB_PROJECT}"
+        --group        "${WANDB_GROUP}"
+        --run_name     "${EXP_NAME}"
+        --tags         "${tags[@]}"
+        --mode         "${WANDB_MODE}")
+    if [ -n "${WANDB_ENTITY}" ]; then
+        TRAIN_CMD+=(--entity "${WANDB_ENTITY}")
+    fi
+}
+
 run_experiment() {
-    local pe="$1" enc_mask="$2"
-    local EXP_NAME="pe_${pe}_enc${enc_mask}"
+    local model="$1" pe="$2" enc_mask="$3" seed="$4"
+    local EXP_NAME; EXP_NAME="$(exp_name "${model}" "${pe}" "${enc_mask}" "${seed}")"
     local EXP_DIR="${EXP_ROOT}/${EXP_NAME}"
     local CKPT="${EXP_DIR}/best.pt"
 
@@ -907,32 +816,8 @@ import torch; c = torch.load('${CKPT}', map_location='cpu', weights_only=False)
 print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val_loss',float('nan')):.4f}\")"
         fi
     else
-    python "${TRAIN_SCRIPT}" \
-        --data_format  ruler \
-        --data_dir     "${TRAIN_DATA_DIR}" \
-        --pe_type      "${pe}" \
-        --encoder_mask "${enc_mask}" \
-        --d_model      "${D_MODEL}" \
-        --num_heads    "${NUM_HEADS}" \
-        --num_layers   "${NUM_LAYERS}" \
-        --d_ff         "${D_FF}" \
-        --dropout      "${DROPOUT}" \
-        --max_len      "${MAX_LEN}" \
-        --tokenizer    "${TOKENIZER}" \
-        --src_len      "${SRC_LEN}" \
-        --tgt_len      "${TGT_LEN}" \
-        --epochs       "${EPOCHS}" \
-        --batch_size   "${BATCH_SIZE}" \
-        --grad_accum   "${GRAD_ACCUM}" \
-        --early_stop_patience   "${EARLY_STOP_PATIENCE}" \
-        --early_stop_min_delta  "${EARLY_STOP_MIN_DELTA}" \
-        --early_stop_min_epochs "${EARLY_STOP_MIN_EPOCHS}" \
-        --lr           "${LR}" \
-        --warmup_steps "${WARMUP}" \
-        --min_lr_frac  "${MIN_LR_FRAC}" \
-        --seed         "${SEED}" \
-        "--${PRECISION}" \
-        --output_dir   "${EXP_DIR}"
+    train_command "${model}" "${pe}" "${enc_mask}" "${seed}"
+    "${TRAIN_CMD[@]}"
     fi
 
     # ---- Phase 2: Evaluate at each RULER sequence length ------------------
@@ -967,11 +852,6 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
             --benchmark synthetic
     done
 
-    # In sanity mode this is a pass/fail gate, not a measurement.
-    if $SANITY; then
-        assert_sanity_score "${EXP_ROOT}/results/${EXP_NAME}/synthetic/${EVAL_SEQ_LENGTHS[0]}/pred/summary.csv"
-    fi
-
     # Every eval length is done and scored, so the weights have served their purpose:
     # predictions and summaries are on disk and are what the analysis reads. Deleting
     # here is safe because 'set -e' aborts before this line if any eval failed, so a
@@ -984,9 +864,20 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
     echo "=== Done: ${EXP_NAME} ==="
 }
 
+# ====================== WANDB PREFLIGHT ======================================
+# Fail before submitting rather than in every job: an online run with no credentials
+# makes each of the jobs die at wandb.init after queueing.
+if [ "${WANDB_MODE}" = "online" ] && ! $DRY_RUN && [ -z "${WANDB_API_KEY:-}" ] \
+        && ! grep -qs "api.wandb.ai" "${HOME}/.netrc"; then
+    echo "ERROR: WANDB_MODE=online but no wandb credentials were found (no WANDB_API_KEY," >&2
+    echo "       no api.wandb.ai entry in ~/.netrc). Run 'wandb login' on a home the" >&2
+    echo "       compute nodes share, export WANDB_API_KEY, or set WANDB_MODE=offline." >&2
+    exit 1
+fi
+
 # ====================== SHARED DATA PREP JOB =================================
-# Training and eval data are identical across all 15 cells. Generating them inside
-# every job would have 15 processes writing the same files concurrently, and
+# Training and eval data are identical across all cells and seeds. Generating them
+# inside every job would have many processes writing the same files concurrently, and
 # prepare.py's "skip if the file exists" check is not atomic. Submit one prep job
 # instead and make every experiment depend on it.
 PREP_JOB_ID=""
@@ -1028,8 +919,8 @@ fi
 n_jobs=0
 
 for cell in "${EXPERIMENTS[@]}"; do
-    read -r pe enc_mask <<< "${cell}"
-    EXP_NAME="pe_${pe}_enc${enc_mask}"
+    read -r model pe enc_mask seed <<< "${cell}"
+    EXP_NAME="$(exp_name "${model}" "${pe}" "${enc_mask}" "${seed}")"
 
     if $LOCAL; then
         # ---------- local: prepare shared data once, then run each experiment ---
@@ -1040,13 +931,15 @@ for cell in "${EXPERIMENTS[@]}"; do
             generate_train_data
             generate_eval_data
         fi
-        run_experiment "${pe}" "${enc_mask}"
+        run_experiment "${model}" "${pe}" "${enc_mask}" "${seed}"
         n_jobs=$((n_jobs + 1))
         continue
     fi
 
     if $DRY_RUN; then
-        echo "[dry-run] would submit: ${EXP_NAME}"
+        train_command "${model}" "${pe}" "${enc_mask}" "${seed}"
+        echo "[dry-run] ${EXP_NAME}"
+        printf '    %q' "${TRAIN_CMD[@]}"; echo
         n_jobs=$((n_jobs + 1))
         continue
     fi
@@ -1077,19 +970,20 @@ set -euo pipefail
 # install would not be visible here and hardcoding false would strand every job with
 # no way to recover.
 $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC)
-$(declare -p KEEP_CHECKPOINTS RETRAIN SANITY SANITY_MIN_SCORE)
-$(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT D_MODEL NUM_HEADS \
-             NUM_LAYERS D_FF DROPOUT MAX_LEN TOKENIZER SRC_LEN TGT_LEN EPOCHS \
-             BATCH_SIZE GRAD_ACCUM LR WARMUP SEED PRECISION EVAL_SEQ_LENGTHS EVAL_SAMPLES \
-             EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC \
-             EVAL_SEED QA_HOLDOUT EVAL_TASKS SCRIPT_DIR)
+$(declare -p KEEP_CHECKPOINTS RETRAIN)
+$(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT MAX_LEN TOKENIZER \
+             SRC_LEN TGT_LEN EPOCHS BATCH_SIZE GRAD_ACCUM LR WARMUP PRECISION \
+             EVAL_SEQ_LENGTHS EVAL_SAMPLES EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA \
+             EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC EVAL_SEED QA_HOLDOUT EVAL_TASKS \
+             REPO_DIR SCRIPT_DIR WANDB_PROJECT WANDB_ENTITY WANDB_GROUP WANDB_MODE)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
 $(declare -f _pip_install)
 $(declare -f check_environment)
 $(declare -f check_gpu)
-$(declare -f assert_sanity_score)
 $(declare -f answer_token_cap)
+$(declare -f exp_name)
+$(declare -f train_command)
 $(declare -f run_experiment)
 
 setup_env
@@ -1099,7 +993,7 @@ echo "Node: \$(hostname)  GPU: \$(nvidia-smi --query-gpu=name --format=csv,nohea
 # Data is produced by the prep job this one depends on; nothing to generate here.
 check_environment
 check_gpu
-run_experiment "${pe}" "${enc_mask}"
+run_experiment "${model}" "${pe}" "${enc_mask}" "${seed}"
 SLURM_EOF
 
     echo "  -> submitted ${EXP_NAME}"
@@ -1108,7 +1002,8 @@ done
 
 echo ""
 echo "========================================================"
-echo "  ${n_jobs} experiments dispatched"
+echo "  ${n_jobs} runs dispatched (${#SEEDS[@]} seeds: ${SEEDS[*]})"
+echo "  wandb     : project ${WANDB_PROJECT}, group ${WANDB_GROUP} (${WANDB_MODE})"
 echo "  Results   : ${EXP_ROOT}/results/"
 echo "  Summaries : bash $0 --summary"
 echo ""

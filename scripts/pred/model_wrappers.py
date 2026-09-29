@@ -133,23 +133,32 @@ class MambaModel:
 
 
 class MaskedTransformerModel:
-    """Wrapper for the custom MaskedTransformer (encoder-decoder).
+    """Wrapper for the tmodel models (``--server_type tmodel``).
 
-    Loads a checkpoint saved by ``scripts/tmodel/train.py`` and exposes the
-    same ``process_batch`` interface used by the RULER prediction pipeline.
+    Loads a ``best.pt`` saved by ``train.py`` / ``train_wandb.py``, rebuilds the model
+    it was trained as (transformer_mask, roformer or alibi) with
+    ``tmodel.models.build_model``, and exposes the ``process_batch`` interface used by
+    the RULER prediction pipeline. Decoding is greedy.
     """
 
     def __init__(self, name_or_path: str, **generation_kwargs) -> None:
         from transformers import AutoTokenizer
         import sys as _sys, os as _os
 
-        # Make the tmodel package importable
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
-        from tmodel import MaskedTransformer
+        # tmodel sits at the repo root, two levels above this file.
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                          "..", ".."))
+        from tmodel.models import build_model
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         ckpt = torch.load(name_or_path, map_location=self.device, weights_only=False)
         model_args = ckpt["args"]
+        if "model" not in model_args:
+            raise ValueError(
+                f"{name_or_path} has no 'model' in its saved args, so it was written by "
+                f"the old MaskedTransformer train.py, which no longer exists. Retrain it "
+                f"with train.py or train_wandb.py."
+            )
 
         # Tokenizer. Training saves it next to the checkpoint because it carries an
         # added pad token; rebuilding from the bare model name would give a different
@@ -177,18 +186,15 @@ class MaskedTransformerModel:
         self.bos_token_id = ckpt.get("bos_token_id", self.tokenizer.bos_token_id)
         self.eos_token_id = ckpt.get("eos_token_id", self.tokenizer.eos_token_id)
 
-        self.max_len = model_args.get("max_len", 8192)
-        self.model = MaskedTransformer(
-            vocab_size=self.vocab_size,
-            d_model=model_args["d_model"],
-            num_heads=model_args["num_heads"],
-            num_encoder_layers=model_args["num_layers"],
-            num_decoder_layers=model_args["num_layers"],
-            d_ff=model_args["d_ff"],
-            pe_type=model_args["pe_type"],
-            encoder_mask_spec=model_args["encoder_mask"],
+        # Same resolution as train.build_model_from_args, so the rebuilt model has the
+        # shapes the weights were saved with.
+        self.max_len = model_args.get("max_len") or (model_args["src_len"]
+                                                     + model_args["tgt_len"])
+        self.model = build_model(
+            model_args["model"], self.vocab_size, self.pad_token_id,
+            mask_spec=model_args.get("encoder_mask", "B"),
+            pe=model_args.get("pe", "none"),
             max_len=self.max_len,
-            pad_token_id=self.pad_token_id,
         )
         self.model.load_state_dict(ckpt["model"])
         self.model.to(self.device).eval()
@@ -197,6 +203,18 @@ class MaskedTransformerModel:
         self.max_new_tokens = generation_kwargs.pop("max_new_tokens", 64)
         self.temperature = generation_kwargs.get("temperature", 0.0)
         self.top_k = generation_kwargs.get("top_k", 0)
+        if self.temperature and self.temperature > 0 and self.top_k != 1:
+            raise NotImplementedError(
+                "tmodel models decode greedily only; pass --temperature 0.0 --top_k 1."
+            )
+
+        # The decoder-only models see BOS + answer after the prompt, all within max_len,
+        # so the prompt must leave room for them. The encoder-decoder's encoder has no
+        # length limit, so its prompt is never truncated.
+        if model_args["model"] == "transformer_mask":
+            self.max_prompt_len = None
+        else:
+            self.max_prompt_len = self.max_len - self.max_new_tokens - 1
         self.n_truncated = 0
 
     def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
@@ -216,9 +234,11 @@ class MaskedTransformerModel:
             # than silently absorbed. Under the configured eval ladder this should
             # always be zero; a non-zero value means the ladder outgrew max_len.
             full_len = len(self.tokenizer(prompt, truncation=False).input_ids)
-            inputs = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=self.max_len,
-            )
+            if self.max_prompt_len is None:
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=False)
+            else:
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True,
+                                        max_length=self.max_prompt_len)
             input_ids = inputs.input_ids.to(self.device)
             truncated = max(0, full_len - input_ids.shape[1])
             if truncated:
@@ -229,23 +249,10 @@ class MaskedTransformerModel:
                     truncated, full_len, input_ids.shape[1], self.max_len,
                 )
 
-            # Autocast, not a .half()/.bfloat16() cast of the weights.
-            #
-            # Evaluation ran in float32, which is where the 8192 OOM on mixed mask specs
-            # comes from. A per-head spec such as CCCCFFFF cannot share one plane across
-            # heads, so its additive mask is [1, heads, L, L] -- 2.00 GB at L=8192 in
-            # float32 against 0.25 GB for a homogeneous spec and nothing at all for an
-            # all-bidirectional one, which passes attn_mask=None. bf16 halves it, and it
-            # also matches the precision the model is now trained in.
-            #
-            # It must be autocast rather than casting the weights, because
-            # _compute_dtype() reads the autocast dtype to decide what dtype to build the
-            # mask in. Casting the weights alone would leave it building a float32 mask
-            # for bf16 queries, and MultiHeadAttention would then convert it per call --
-            # allocating a second copy of that same [1, heads, L, L] tensor on every
-            # layer of every forward pass, which is worse than the problem being fixed.
-            # self.device is a STRING here ("cuda"/"cpu"), not a torch.device, so it has
-            # no .type -- compare the string.
+            # bf16 autocast on GPU, matching the precision the models are trained in and
+            # halving the [L, L] attention and mask tensors at L=8192. Autocast rather
+            # than casting the weights, so the masks and biases the models build follow
+            # the compute dtype. self.device is a STRING ("cuda"/"cpu").
             amp = torch.autocast("cuda", dtype=torch.bfloat16,
                                  enabled=str(self.device).startswith("cuda"))
             with amp:
@@ -254,8 +261,6 @@ class MaskedTransformerModel:
                     max_new_tokens=self.max_new_tokens,
                     bos_token_id=self.bos_token_id,
                     eos_token_id=self.eos_token_id,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
                 )
 
             # Decode (skip the leading BOS token the decoder started with)

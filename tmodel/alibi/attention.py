@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from alibi.config import ALiBiConfig
+from tmodel.alibi.config import ALiBiConfig
 
 
 def get_relative_positions(seq_len: int) -> torch.tensor:
@@ -46,7 +46,7 @@ class ALiBiMultiHeadAttention(nn.Module):
         value = value.view(batch_size, seq_len, self.num_heads, -1).transpose(1, 2)
         # qv.shape == (batch_size, num_heads, seq_len, d_head)
 
-        bias = (self.m * get_relative_positions(seq_len)).unsqueeze(0)
+        bias = (self.m * get_relative_positions(seq_len).to(x.device)).unsqueeze(0)
         # bias.shape == (1, num_heads, seq_len, seq_len)
 
         score = torch.matmul(query, key) / self.scale + bias

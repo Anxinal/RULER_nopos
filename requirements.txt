@@ -14,8 +14,10 @@
 
 # Model and training
 torch>=2.1            # scaled_dot_product_attention
-transformers>=4.40    # AutoTokenizer
+transformers>=5.17    # AutoTokenizer; >=5 for tmodel/roformer (PreTrainedConfig, masking_utils)
 datasets>=2.14        # only for train.py --data_format text
+wandb>=0.19           # train_wandb.py
+torch_geometric>=2.8  # sinusoidal encoding for train.py --pe sinusoidal
 numpy>=1.24           # niah, variable_tracking, freq_words_extraction
 
 # Data generation
