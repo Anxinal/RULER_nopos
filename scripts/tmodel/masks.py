@@ -57,6 +57,29 @@ SOFT_MASK_TAU_DEFAULT = 64.0
 MASK_NEG = -1e4
 
 
+def bucket_dim(dim: int) -> int:
+    """Round a sequence length up to the next power of two (minimum 256).
+
+    Both mask caches are keyed on the sequence length, and at prediction time
+    ``--batch_size 1`` means that length is each prompt's exact token count. Eval prompts
+    do not come out all the same length -- vt_2chain at the 2048 rung spans 1913-2048 --
+    so every prompt was minting a fresh cache entry that nothing ever reused. For a
+    per-head spec such as CCCCFFFF the entry is ``[1, heads, L, L]``: 2.00 GB at L=8192
+    in float32, so roughly forty distinct lengths exhausted an 80 GB card. That is the
+    8192 OOM, and it is confined to masked arms because an all-bidirectional spec returns
+    None and caches nothing at all.
+
+    Bucketing is sound because every mask here is a function of the offset ``j - i``
+    alone, so the top-left ``q x q`` block of a ``D x D`` plane IS the ``q x q`` plane.
+    The callers already slice with ``mask[..., :q_len, :k_len]``, so building at the
+    bucketed size and slicing returns exactly what building at the exact size would.
+
+    Powers of two, rather than a finer grid, because entries below the largest one in use
+    are redundant once it exists: a single 8192 plane serves every prompt from 4097 up.
+    """
+    return 1 << max(8, (max(int(dim), 1) - 1).bit_length())
+
+
 
 
 class Mask(ABC):

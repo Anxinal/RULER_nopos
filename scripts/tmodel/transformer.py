@@ -32,8 +32,8 @@ from typing import Optional
 from .PositionalEmbeddings import build_positional_embedding
 from .transformer_encoder import TransformerEncoder
 from .transformer_decoder import TransformerDecoder
-from .masks import (MASK_NEG, build_head_mask_bias, parse_mask_spec,
-                    spec_can_empty_rows)
+from .masks import (MASK_NEG, bucket_dim, build_head_mask_bias,
+                    parse_mask_spec, spec_can_empty_rows)
 
 # The decoder must be able to attend only to what it has already produced.
 DECODER_MASK_TYPE = "C"
@@ -205,17 +205,34 @@ class MaskedTransformer(nn.Module):
         bias = None
         n_terms = 0
 
+        # Both cached terms below are built at a BUCKETED length and then sliced to the
+        # real one. Keying either cache on the exact length makes it grow once per
+        # distinct prompt at eval, where batch_size is 1 -- see bucket_dim.
+        cache_len = bucket_dim(max(q_len, k_len))
+
         # Per-head ALiBi term -> [1, heads, q_len, k_len]
         if use_alibi:
-            alibi = self.pe.attention_bias(q_len, k_len, self.num_heads, device, dtype)
+            # Only safe to bucket when the two lengths agree, which is self-attention.
+            # attention_bias right-aligns the queries (q_pos = arange(k_len - q_len,
+            # k_len)) for incremental decoding, so a larger plane's top-left block is
+            # not the smaller one when q_len != k_len. Cross-attention never gets ALiBi
+            # anyway, so the exact-size path here is the single-query decode step.
+            if q_len == k_len:
+                alibi = self.pe.attention_bias(cache_len, cache_len, self.num_heads,
+                                               device, dtype)
+            else:
+                alibi = self.pe.attention_bias(q_len, k_len, self.num_heads,
+                                               device, dtype)
             if alibi is not None:
+                alibi = alibi[..., :q_len, :k_len]
                 bias = alibi.unsqueeze(0)
                 n_terms += 1
 
         # Mask, cached: [1, 1, q_len, k_len] if every head shares a code, else
         # [1, heads, q_len, k_len].
         if mask_spec is not None:
-            mask = build_head_mask_bias(mask_spec, self.num_heads, q_len, device, dtype)
+            mask = build_head_mask_bias(mask_spec, self.num_heads, cache_len,
+                                        device, dtype)
             if mask is not None:
                 mask = mask[..., :q_len, :k_len]
                 bias = mask if bias is None else bias + mask
