@@ -244,8 +244,10 @@ class MaskedTransformerModel:
             # for bf16 queries, and MultiHeadAttention would then convert it per call --
             # allocating a second copy of that same [1, heads, L, L] tensor on every
             # layer of every forward pass, which is worse than the problem being fixed.
+            # self.device is a STRING here ("cuda"/"cpu"), not a torch.device, so it has
+            # no .type -- compare the string.
             amp = torch.autocast("cuda", dtype=torch.bfloat16,
-                                 enabled=self.device.type == "cuda")
+                                 enabled=str(self.device).startswith("cuda"))
             with amp:
                 output_ids = self.model.generate(
                     input_ids,
