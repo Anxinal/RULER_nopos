@@ -229,14 +229,32 @@ class MaskedTransformerModel:
                     truncated, full_len, input_ids.shape[1], self.max_len,
                 )
 
-            output_ids = self.model.generate(
-                input_ids,
-                max_new_tokens=self.max_new_tokens,
-                bos_token_id=self.bos_token_id,
-                eos_token_id=self.eos_token_id,
-                temperature=self.temperature,
-                top_k=self.top_k,
-            )
+            # Autocast, not a .half()/.bfloat16() cast of the weights.
+            #
+            # Evaluation ran in float32, which is where the 8192 OOM on mixed mask specs
+            # comes from. A per-head spec such as CCCCFFFF cannot share one plane across
+            # heads, so its additive mask is [1, heads, L, L] -- 2.00 GB at L=8192 in
+            # float32 against 0.25 GB for a homogeneous spec and nothing at all for an
+            # all-bidirectional one, which passes attn_mask=None. bf16 halves it, and it
+            # also matches the precision the model is now trained in.
+            #
+            # It must be autocast rather than casting the weights, because
+            # _compute_dtype() reads the autocast dtype to decide what dtype to build the
+            # mask in. Casting the weights alone would leave it building a float32 mask
+            # for bf16 queries, and MultiHeadAttention would then convert it per call --
+            # allocating a second copy of that same [1, heads, L, L] tensor on every
+            # layer of every forward pass, which is worse than the problem being fixed.
+            amp = torch.autocast("cuda", dtype=torch.bfloat16,
+                                 enabled=self.device.type == "cuda")
+            with amp:
+                output_ids = self.model.generate(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    bos_token_id=self.bos_token_id,
+                    eos_token_id=self.eos_token_id,
+                    temperature=self.temperature,
+                    top_k=self.top_k,
+                )
 
             # Decode (skip the leading BOS token the decoder started with)
             text = self.tokenizer.decode(output_ids[0, 1:], skip_special_tokens=True)
