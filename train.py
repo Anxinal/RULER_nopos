@@ -257,30 +257,6 @@ def tokenize_split(tokenizer, dataset_name, subset, split, max_tokens=None):
 
 
 # ------------------------------------------------------------------
-# LR schedule
-# ------------------------------------------------------------------
-
-def cosine_with_warmup(optimizer, warmup: int, total: int, min_frac: float = 0.0):
-    """Cosine decay with warmup, bottoming out at *min_frac* of the peak LR.
-
-    The floor is not cosmetic. Escaping the answer-prior basin -- where the model emits
-    a memorised output format and ignores the context entirely -- is a discrete circuit
-    formation rather than a smooth descent, so it depends on the step size still being
-    large enough to explore. The one arm that solved the task did so around epoch 8,
-    while the LR was still near peak; arms that were still searching at epoch 14 were
-    already down to 9e-5, and by 17 to 5e-5. Decaying to exactly zero turns "this
-    circuit is harder to find" into "this circuit is never found".
-    """
-    def _lr(step):
-        if step < warmup:
-            return step / max(1, warmup)
-        progress = (step - warmup) / max(1, total - warmup)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_frac + (1.0 - min_frac) * cosine
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr)
-
-
-# ------------------------------------------------------------------
 # Training & evaluation loops
 # ------------------------------------------------------------------
 
@@ -581,6 +557,7 @@ def build_model_from_args(args, vocab_size, pad_id):
         mask_spec=args.encoder_mask,
         pe=args.pe,
         max_len=args.max_len or args.src_len + args.tgt_len,
+        dropout=args.dropout,
     )
 
 
@@ -631,8 +608,11 @@ def main(args, wandb_run=None):
         len(train_loader), args.grad_accum, steps_per_epoch, total_steps, warmup,
         args.batch_size * args.grad_accum,
     )
-    scheduler = cosine_with_warmup(optimizer, warmup, total_steps,
-                                   min_frac=args.min_lr_frac)
+    # Inverse square root (transformers' implementation, with its defaults): linear
+    # warmup to --lr over `warmup` steps, then lr = peak * sqrt(warmup / step). It does
+    # not depend on total_steps, so an early stop never cuts a schedule short.
+    from transformers import get_inverse_sqrt_schedule
+    scheduler = get_inverse_sqrt_schedule(optimizer, num_warmup_steps=warmup)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
 
     # Sanity-check the initialisation before spending hours on it. An untrained model
@@ -834,7 +814,6 @@ def main(args, wandb_run=None):
                 log.info("Early stop at epoch %d: %s", epoch, stop_reason)
                 break
 
-    last_lr = scheduler.get_last_lr()[0] if scheduler else args.lr
     log.info("Done (%s). Best val_loss=%.4f at epoch %d/%d  Saved to %s",
              stop_reason, best_val, best_epoch, args.epochs, args.output_dir)
     if best_epoch == 0:
@@ -853,14 +832,6 @@ def main(args, wandb_run=None):
         json.dump(complete, f, indent=2)
     if wandb_run is not None:
         wandb_run.summary.update(complete)
-
-    if stop_reason != "epoch cap":
-        # Cosine is sized from the epoch cap, so an early stop leaves the LR partway
-        # down its curve. Worth seeing, since a still-high LR means annealing might
-        # have bought more had training continued.
-        log.info("  note: stopped mid-schedule, LR was %.2e (peak %.2e). If that is "
-                 "still high, some of the remaining gain may be annealing, not capacity.",
-                 last_lr, args.lr)
 
 
 # ------------------------------------------------------------------
@@ -883,6 +854,9 @@ def add_model_args(p):
                    help="transformer_mask only. 'sinusoidal' adds the sinusoidal encoding "
                         "of 'Attention Is All You Need' (torch_geometric) to the encoder "
                         "and decoder inputs; 'none' leaves position to the masks.")
+    g.add_argument("--dropout", type=float, default=None,
+                   help="Override every dropout rate in the model (attention included). "
+                        "Default: each library's own (0.1 for all three).")
     g.add_argument("--max_len", type=int, default=None,
                    help="roformer / alibi only: longest prompt + answer the model accepts. "
                         "Default --src_len + --tgt_len. Set it to the longest EVAL length "
@@ -938,9 +912,6 @@ def build_parser():
     g.add_argument("--weight_decay", type=float, default=0.01)
     g.add_argument("--grad_clip", type=float, default=1.0)
     g.add_argument("--warmup_steps", type=int, default=1000)
-    g.add_argument("--min_lr_frac", type=float, default=0.0,
-                   help="Floor the cosine schedule at this fraction of the peak LR "
-                        "instead of decaying to zero. See cosine_with_warmup.")
     g.add_argument("--fp16", action="store_true",
                    help="Mixed precision in float16, with a GradScaler. Prefer --bf16: "
                         "fp16's 65504 ceiling makes the scaler back off, and it only "

@@ -85,6 +85,9 @@ TORCH_SPEC="${TORCH_SPEC:-}"
 # mask spec below is one code per head. MAX_LEN is set after the data section.
 TM_NUM_HEADS=8
 TOKENIZER="gpt2"
+# The one override of the library defaults: every dropout rate in every model (0.1 in
+# all three libraries), attention dropout included. Passed as train.py --dropout.
+DROPOUT=0.0
 
 # ====================== DATA =================================================
 # Length-generalisation design: train at one length, evaluate at multiples of it.
@@ -104,7 +107,7 @@ TRAIN_SAMPLES="${TRAIN_SAMPLES:-25000}"   # samples per task per seq length
 # MUST differ from EVAL_SEED. Both were 42, which made the two prepare.py runs produce
 # identical RNG streams at the same --max_seq_length, so every eval sample at the train
 # length was literally a training sample and that whole column measured memorisation.
-TRAIN_SEED=1234
+TRAIN_SEED=934
 
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
@@ -129,18 +132,15 @@ EPOCHS=30
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 
-LR=2e-4
+# Peak LR. The schedule is inverse square root (train.py): linear warmup to LR over
+# WARMUP optimizer steps, then LR * sqrt(WARMUP / step).
+LR=7e-4
 
 WARMUP=3000
 
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
 EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
-# Floor the cosine schedule at this fraction of the peak LR rather than decaying to 0.
-# Escape from the format basin is a circuit formation, not a smooth descent, so it needs
-# a step size large enough to explore. The arm that solved the task escaped at epoch 8
-# with LR near peak; failing arms were at 5e-5 by the time they stopped.
-MIN_LR_FRAC="${MIN_LR_FRAC:-0.25}"
 
 PRECISION="${PRECISION:-bf16}"
 SRC_LEN=2048                # max encoder tokens during training
@@ -759,6 +759,7 @@ train_command() {
     fi
     TRAIN_CMD+=(
         --max_len      "${MAX_LEN}"
+        --dropout      "${DROPOUT}"
         --data_format  ruler
         --data_dir     "${TRAIN_DATA_DIR}"
         --tokenizer    "${TOKENIZER}"
@@ -772,7 +773,6 @@ train_command() {
         --early_stop_min_epochs "${EARLY_STOP_MIN_EPOCHS}"
         --lr           "${LR}"
         --warmup_steps "${WARMUP}"
-        --min_lr_frac  "${MIN_LR_FRAC}"
         --seed         "${seed}"
         "--${PRECISION}"
         --output_dir   "${EXP_ROOT}/${EXP_NAME}"
@@ -974,7 +974,7 @@ $(declare -p KEEP_CHECKPOINTS RETRAIN)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT MAX_LEN TOKENIZER \
              SRC_LEN TGT_LEN EPOCHS BATCH_SIZE GRAD_ACCUM LR WARMUP PRECISION \
              EVAL_SEQ_LENGTHS EVAL_SAMPLES EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA \
-             EARLY_STOP_MIN_EPOCHS MIN_LR_FRAC EVAL_SEED QA_HOLDOUT EVAL_TASKS \
+             EARLY_STOP_MIN_EPOCHS DROPOUT EVAL_SEED QA_HOLDOUT EVAL_TASKS \
              REPO_DIR SCRIPT_DIR WANDB_PROJECT WANDB_ENTITY WANDB_GROUP WANDB_MODE)
 $(declare -f setup_env)
 $(declare -f _missing_packages)

@@ -64,6 +64,20 @@ class TokenLM(nn.Module):
         return out
 
 
+def set_dropout(module: nn.Module, p: float) -> None:
+    """Set every dropout rate inside *module* to *p*.
+
+    nn.Transformer keeps dropout in two forms: nn.Dropout modules in each layer, and a
+    plain float on each nn.MultiheadAttention that it passes to the attention kernel.
+    Setting only the modules would leave attention dropout at its default.
+    """
+    for m in module.modules():
+        if isinstance(m, nn.Dropout):
+            m.p = p
+        elif isinstance(m, nn.MultiheadAttention):
+            m.dropout = p
+
+
 class TransformerMaskLM(TokenLM):
     """:class:`TransformerMask` with token embeddings and an output projection.
 
@@ -80,12 +94,17 @@ class TransformerMaskLM(TokenLM):
     """
 
     def __init__(self, vocab_size: int, pad_token_id: int, mask_spec: str,
-                 pe: str = "none"):
+                 pe: str = "none", dropout: float | None = None):
         super().__init__()
         if pe not in PE_TYPES:
             raise ValueError(f"unknown pe {pe!r}; expected one of {PE_TYPES}")
         self.pad_token_id = pad_token_id
         self.transformer = TransformerMask(mask_spec)
+        # TransformerMask takes only mask_spec, so a dropout override is applied to the
+        # built layers. None keeps nn.Transformer's 0.1.
+        if dropout is not None:
+            set_dropout(self.transformer, dropout)
+        dropout_rate = self.transformer.encoder.layers[0].dropout.p
         d_model = self.transformer.d_model
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
         self.pos_encoding = None
@@ -96,7 +115,7 @@ class TransformerMaskLM(TokenLM):
             self.pos_encoding = PositionalEncoding(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)
         self.description = (f"transformer_mask (encoder-decoder, nn.Transformer defaults) "
-                            f"| enc_mask={mask_spec} | pe={pe}")
+                            f"| enc_mask={mask_spec} | pe={pe} | dropout {dropout_rate}")
 
     def _embed(self, ids: torch.Tensor) -> torch.Tensor:
         """``[batch, len]`` ids -> ``[len, batch, d_model]`` (nn.Transformer is seq-first).
@@ -198,19 +217,24 @@ class RoFormerLM(DecoderOnlyLM):
 
     Uses ``RoFormerConfig``'s defaults (768 wide, 12 heads, 12 layers, feed-forward
     3072, dropout 0.1). Only what the data or the decoder-only setup requires is set:
-    the vocabulary, the pad id, ``is_decoder`` (for the causal mask) and ``max_len``.
+    the vocabulary, the pad id, ``is_decoder`` (for the causal mask) and ``max_len``,
+    plus ``dropout`` when overridden.
     """
 
-    def __init__(self, vocab_size: int, pad_token_id: int, max_len: int):
+    def __init__(self, vocab_size: int, pad_token_id: int, max_len: int,
+                 dropout: float | None = None):
         super().__init__()
         # Imported here, not at module level: it needs transformers>=5, and the other
         # two models should not.
         from .roformer import RoFormerConfig, RoFormerForCausalLM
 
         self.pad_token_id = pad_token_id
+        # None keeps RoFormerConfig's 0.1 for both the hidden and the attention dropout.
+        dropout_kwargs = ({} if dropout is None else
+                          dict(hidden_dropout_prob=dropout, attention_probs_dropout_prob=dropout))
         config = RoFormerConfig(vocab_size=vocab_size, pad_token_id=pad_token_id,
                                 max_position_embeddings=max_len, is_decoder=True,
-                                use_cache=False)
+                                use_cache=False, **dropout_kwargs)
         self.model = RoFormerForCausalLM(config)
         self.description = (f"roformer (decoder-only, RoPE) | RoFormerConfig defaults: "
                             f"{config.hidden_size} wide, {config.num_attention_heads} heads, "
@@ -230,15 +254,18 @@ class ALiBiLM(DecoderOnlyLM):
     """:class:`ALiBiTransformer` with token embeddings, a final norm and an output head.
 
     Uses ``ALiBiConfig``'s defaults (see ``tmodel/alibi/config.py``); only ``max_len``
-    is set. The upstream model works
+    is set, plus ``dropout`` when overridden. The upstream model works
     on vectors and its pre-norm layers end without a final LayerNorm, so the embedding,
     the final norm and the output head are added here.
     """
 
-    def __init__(self, vocab_size: int, pad_token_id: int, max_len: int):
+    def __init__(self, vocab_size: int, pad_token_id: int, max_len: int,
+                 dropout: float | None = None):
         super().__init__()
         self.pad_token_id = pad_token_id
-        config = ALiBiConfig(max_len=max_len)
+        # None keeps ALiBiConfig's dropout.
+        config = ALiBiConfig(max_len=max_len,
+                             **({} if dropout is None else dict(dropout=dropout)))
         if not config.causal:
             raise ValueError("ALiBiConfig must be causal: the model is trained decoder-only.")
         self.embed = nn.Embedding(vocab_size, config.d_model, padding_idx=pad_token_id)
@@ -258,7 +285,8 @@ class ALiBiLM(DecoderOnlyLM):
 
 
 def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
-                mask_spec: str = "B", pe: str = "none", max_len: int = 2176) -> TokenLM:
+                mask_spec: str = "B", pe: str = "none", max_len: int = 2176,
+                dropout: float | None = None) -> TokenLM:
     """Build one of :data:`MODEL_TYPES` with the shared ``model(src, tgt_in)`` interface.
 
     Every model uses its own library's default hyperparameters: ``nn.Transformer``'s for
@@ -271,14 +299,16 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
       Their defaults are shorter than a RULER sample (2048-token prompts), so it has
       to be set; ``train.py`` passes ``src_len + tgt_len``. The ALiBi model allocates a
       ``[max_len, max_len]`` causal mask in every layer.
+    * ``dropout``   -- every model: overrides its library's dropout rate (all of them,
+      attention included). ``None`` keeps the library default.
     """
     if model_type == "transformer_mask":
-        return TransformerMaskLM(vocab_size, pad_token_id, mask_spec, pe)
+        return TransformerMaskLM(vocab_size, pad_token_id, mask_spec, pe, dropout)
     if pe != "none":
         raise ValueError(f"pe={pe!r} applies to transformer_mask only; {model_type} "
                          f"has its own position encoding.")
     if model_type == "roformer":
-        return RoFormerLM(vocab_size, pad_token_id, max_len)
+        return RoFormerLM(vocab_size, pad_token_id, max_len, dropout)
     if model_type == "alibi":
-        return ALiBiLM(vocab_size, pad_token_id, max_len)
+        return ALiBiLM(vocab_size, pad_token_id, max_len, dropout)
     raise ValueError(f"unknown model {model_type!r}; expected one of {MODEL_TYPES}")
