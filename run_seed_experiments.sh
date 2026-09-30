@@ -135,7 +135,7 @@ GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 
 # Peak LR. The schedule is inverse square root (train.py): linear warmup to LR over
 # WARMUP optimizer steps, then LR * sqrt(WARMUP / step).
-LR=7e-4
+LR=3e-4
 
 WARMUP=3000
 

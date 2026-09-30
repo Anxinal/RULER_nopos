@@ -286,6 +286,11 @@ RECENT_WINDOW = 200
 # underflowed.
 MAX_ZERO_GRAD_STEPS = 50
 
+# Consecutive optimizer steps skipped for a non-finite gradient (bf16/fp32) before the
+# run is declared dead. An isolated bad batch is skipped and training carries on; a long
+# unbroken streak means every update is being discarded, so the run cannot learn.
+MAX_NONFINITE_GRAD_STEPS = 50
+
 
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
               scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
@@ -329,6 +334,7 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                  scale=float("nan"))
     grad_norm = float("nan")
     zero_grad_streak = 0
+    nonfinite_grad_streak = 0
 
     if is_train:
         optimizer.zero_grad(set_to_none=True)
@@ -406,7 +412,28 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                         stats["n_skipped_steps"] += 1
                 else:
                     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    optimizer.step()
+                    # bf16/fp32 have no GradScaler to skip a non-finite gradient, and
+                    # clipping does not remove one: it scales an inf entry by 0, giving
+                    # NaN, and a single AdamW step then writes NaN into the weights, after
+                    # which every batch is non-finite for the rest of the run. Skip the
+                    # update instead, as GradScaler does for fp16.
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
+                        nonfinite_grad_streak = 0
+                    else:
+                        stats["n_skipped_steps"] += 1
+                        nonfinite_grad_streak += 1
+                        if stats["n_skipped_steps"] <= 5:
+                            log.warning("  step %d: gradient norm is %s (loss %.4f); "
+                                        "optimizer step skipped.", step,
+                                        float(grad_norm), loss_val)
+                        if nonfinite_grad_streak >= MAX_NONFINITE_GRAD_STEPS:
+                            raise RuntimeError(
+                                f"{nonfinite_grad_streak} consecutive optimizer steps had "
+                                f"a non-finite gradient norm, so every update is being "
+                                f"skipped and the model is not training. Stopping "
+                                f"instead of burning the time limit; lower --lr."
+                            )
                 grad_norm = float(grad_norm)
                 stats["last_grad_norm"] = grad_norm
                 stats["n_opt_steps"] += 1
