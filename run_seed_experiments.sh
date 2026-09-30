@@ -100,10 +100,11 @@ DROPOUT=0.0
 # point of the experiment, and it is also much cheaper: cost per sample grows with
 # the square of the sequence length in attention.
 TRAIN_SEQ_LENGTHS=(2048)    # seq lengths for training data
-# Samples per task per seq length -- PER TASK, so five tasks train on 125k samples. For
+# Samples per task per seq length -- PER TASK, so the seven TRAIN_TASKS generate 224k
+# samples (train.py holds 10% of them out for validation). For
 # the QA tasks this exceeds the unique training questions (see QA_HOLDOUT), so each is
 # reused a few times with a different draw of distractor paragraphs.
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-25000}"   # samples per task per seq length
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-32000}"   # samples per task per seq length
 # MUST differ from EVAL_SEED. Both were 42, which made the two prepare.py runs produce
 # identical RNG streams at the same --max_seq_length, so every eval sample at the train
 # length was literally a training sample and that whole column measured memorisation.
@@ -147,7 +148,7 @@ SRC_LEN=2048                # max encoder tokens during training
 TGT_LEN=128                # max decoder tokens during training
 # Seeds for the sweep; each arm is trained and evaluated once per seed.
 # Override with e.g. SEEDS="1 2 3".
-read -r -a SEEDS <<< "${SEEDS:-42 43 44}"
+read -r -a SEEDS <<< "${SEEDS:-96 97}"
 # Longest prompt + answer the decoder-only models must accept: prompts go up to the
 # longest EVAL length, so the default (SRC_LEN + TGT_LEN) would truncate them at 4096 and
 # 8192. Note the ALiBi model keeps a MAX_LEN x MAX_LEN causal mask per layer (~1.7 GB over
