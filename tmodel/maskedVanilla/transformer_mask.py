@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from .masks import build_head_mask_bias, parse_mask_spec, spec_can_empty_rows
+from .masks import bucket_dim, build_head_mask_bias, parse_mask_spec, spec_can_empty_rows
 
 
 class TransformerMask(nn.Transformer):
@@ -68,9 +68,15 @@ class MaskedEncoder(nn.TransformerEncoder):
             bsz, seq_len = src.shape[0], src.shape[1]
         else:
             seq_len, bsz = src.shape[0], src.shape[1]
-        bias = build_head_mask_bias(self.mask_spec, self.num_heads, seq_len,
+        # Build at the bucketed length and slice, never at the exact length. The mask
+        # caches are keyed on length, and every eval prompt has its own, so exact-length
+        # requests added a permanent entry per prompt -- ~2.5 GB each for CCCCFFFF at
+        # 8192 -- until the GPU ran out. Every mask here depends only on j - i, so the
+        # top-left L x L block of the bucketed plane is exactly the L x L mask.
+        bias = build_head_mask_bias(self.mask_spec, self.num_heads, bucket_dim(seq_len),
                                     src.device, src.dtype)
         if bias is not None:
+            bias = bias[..., :seq_len, :seq_len]
             if src_key_padding_mask is not None and spec_can_empty_rows(self.mask_spec,
                                                                         self.num_heads):
                 # A future-only head at a padded query can only see later keys, which
