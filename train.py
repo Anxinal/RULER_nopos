@@ -7,8 +7,9 @@ Models (``--model``, built by ``tmodel/models.py``)
 * ``roformer``          decoder-only, rotary position embeddings.
 * ``alibi``             decoder-only, ALiBi.
 
-Each model uses its own library's default hyperparameters (``nn.Transformer``,
-``RoFormerConfig``, ``ALiBiConfig``), so there are no size flags. The decoder-only
+transformer_mask and alibi use their library's default hyperparameters
+(``nn.Transformer``, ``ALiBiConfig``); roformer is sized to match transformer_mask
+(512 wide, 14 layers; see ``tmodel/models.py``). There are no size flags. The decoder-only
 models' maximum length is set to ``--src_len + --tgt_len``.
 
 The decoder-only models see prompt + answer as one sequence and are scored on the
@@ -90,9 +91,14 @@ class RulerDataset(Dataset):
     concatenates it back on before calling the model (see ``pred/call_api.py``).
     Reading ``input`` alone here would train the model on a prompt that never occurs
     at evaluation time.
+
+    *tasks*, if given, keeps only those task directories, and every one of them must
+    have data: a curriculum stage that silently loads two of its three tasks would
+    train on the wrong mixture without saying so.
     """
 
-    def __init__(self, data_dir, tokenizer, max_src_len=2048, max_tgt_len=128):
+    def __init__(self, data_dir, tokenizer, max_src_len=2048, max_tgt_len=128,
+                 tasks=None):
         self.tokenizer = tokenizer
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
@@ -108,6 +114,8 @@ class RulerDataset(Dataset):
             # prepare.py writes <save_dir>/<task>/<subset>.jsonl, so the parent
             # directory names the task.
             task = os.path.basename(os.path.dirname(fpath))
+            if tasks is not None and task not in tasks:
+                continue
             with open(fpath, encoding="utf-8") as f:
                 for line in f:
                     item = json.loads(line)
@@ -120,6 +128,12 @@ class RulerDataset(Dataset):
                         self.samples.append((prompt, answer))
                         per_task[task] += 1
 
+        missing = sorted(set(tasks or ()) - set(per_task))
+        if missing:
+            raise FileNotFoundError(
+                f"no data for task(s) {', '.join(missing)} under {data_dir}. Generate "
+                f"them with scripts/data/prepare.py --task <name>."
+            )
         log.info("RulerDataset: loaded %d samples from %s", len(self.samples), data_dir)
         # Per task, not just the total. This glob is recursive over the whole data root,
         # so a task dropped from the suite keeps being trained on until its directory is
@@ -159,31 +173,52 @@ class RulerDataset(Dataset):
         answer = " ".join(str(o) for o in outputs if str(o))
         return prompt.rstrip(), " " + answer.lstrip()
 
+    def _encode_src(self, src_text):
+        """Tokenize a prompt, keeping its LAST ``max_src_len`` tokens.
+
+        RULER puts the question and answer_prefix at the end of the prompt, so the
+        tokenizer's default right-side truncation would cut exactly what the model has to
+        answer. Prediction truncates from the left too (pred/model_wrappers.py).
+        Sliced here rather than by setting tokenizer.truncation_side, which would leak
+        into the tokenizer that main() saves beside the checkpoint.
+        """
+        return self.tokenizer.encode(src_text)[-self.max_src_len:]
+
     def _report_copy_rate(self):
         """Log how often the target is a verbatim token subsequence of the source.
 
         This single number separates "this is a copy task the model can learn" from
-        "this is not", and nothing in the pipeline reported it before. Sampled, since
-        tokenising every source at 2048 tokens would be slow.
+        "this is not", and nothing in the pipeline reported it before. Measured on the
+        truncated source the model actually sees, so a needle cut off by --src_len
+        counts as not copyable. Sampled, since tokenising every source at 2048 tokens
+        would be slow; the same sample estimates how often truncation happens.
         """
         if not self.samples:
             return
         step = max(1, len(self.samples) // 200)
         probe = self.samples[::step][:200]
-        copyable = 0
+        copyable = truncated = 0
         for src_text, tgt_text in probe:
-            src = self.tokenizer.encode(src_text)
+            full = self.tokenizer.encode(src_text)
+            truncated += len(full) > self.max_src_len
+            src = full[-self.max_src_len:]
             tgt = self.tokenizer.encode(tgt_text)
             if tgt and any(src[i:i + len(tgt)] == tgt
                            for i in range(len(src) - len(tgt) + 1)):
                 copyable += 1
+        if truncated:
+            log.warning("RulerDataset: %d of %d sampled prompts exceed --src_len %d and "
+                        "lose their start (the end, with the question, is kept)",
+                        truncated, len(probe), self.max_src_len)
         pct = 100.0 * copyable / len(probe)
         log.info("RulerDataset: target is a verbatim copy of the source in %.0f%% of "
                  "%d sampled examples", pct, len(probe))
         if pct < 50:
             log.warning(
                 "Most targets are NOT copies of the source. The model cannot solve "
-                "these by retrieval, only by memorisation -- check tokenisation."
+                "these by retrieval, only by memorisation -- check tokenisation"
+                + (", and raise --src_len: truncation is cutting needles out."
+                   if truncated else ".")
             )
 
     def __len__(self):
@@ -191,8 +226,7 @@ class RulerDataset(Dataset):
 
     def __getitem__(self, idx):
         src_text, tgt_text = self.samples[idx]
-        src_ids = self.tokenizer.encode(src_text, truncation=True,
-                                        max_length=self.max_src_len)
+        src_ids = self._encode_src(src_text)
         # Reserve two slots for the BOS/EOS wrapper below.
         tgt_ids = self.tokenizer.encode(tgt_text, truncation=True,
                                         max_length=max(1, self.max_tgt_len - 2))
@@ -509,11 +543,15 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
 # Data builder
 # ------------------------------------------------------------------
 
-def build_dataloaders(args, tokenizer, pad_id):
-    """Return (train_loader, val_loader) based on ``args.data_format``."""
+def build_dataloaders(args, tokenizer, pad_id, tasks=None):
+    """Return (train_loader, val_loader) based on ``args.data_format``.
+
+    *tasks* restricts RULER data to those task directories (see :class:`RulerDataset`).
+    """
     if args.data_format == "ruler":
         train_ds = RulerDataset(args.data_dir, tokenizer,
-                                max_src_len=args.src_len, max_tgt_len=args.tgt_len)
+                                max_src_len=args.src_len, max_tgt_len=args.tgt_len,
+                                tasks=tasks)
         # Use 10 % of samples as validation (deterministic split)
         n_val = max(1, len(train_ds) // 10)
         n_train = len(train_ds) - n_val
@@ -577,7 +615,7 @@ def build_tokenizer(name):
 
 def build_model_from_args(args, vocab_size, pad_id):
     """Build ``args.model`` from the flags added by :func:`add_model_args`."""
-    # Sizes are each library's defaults (see tmodel/models.py). max_len is the one thing
+    # Sizes are fixed in tmodel/models.py. max_len is the one thing
     # the data dictates: by default the longest prompt + answer the loaders produce.
     return build_model(
         args.model, vocab_size, pad_id,
@@ -588,12 +626,85 @@ def build_model_from_args(args, vocab_size, pad_id):
     )
 
 
+def build_optimizer(args, model, n_batches, epochs, warmup=None):
+    """Return ``(optimizer, scheduler, warmup)`` for *epochs* of *n_batches* each.
+
+    *warmup* defaults to ``min(--warmup_steps, total_steps // 10)``. A stage that
+    continues another (train_full.py after train_start.py) passes the earlier stage's
+    value instead, because the inverse-sqrt decay depends on it and a different value
+    would make the learning rate jump at the switch.
+    """
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay, betas=(0.9, 0.98))
+    # The scheduler counts optimizer steps, not batches, so accumulation divides it.
+    steps_per_epoch = math.ceil(n_batches / args.grad_accum)
+    total_steps = steps_per_epoch * epochs
+    if warmup is None:
+        warmup = min(args.warmup_steps, total_steps // 10)
+    log.info(
+        "Schedule: %d batches/epoch | accum %d -> %d steps/epoch | %d total | warmup %d "
+        "| effective batch %d",
+        n_batches, args.grad_accum, steps_per_epoch, total_steps, warmup,
+        args.batch_size * args.grad_accum,
+    )
+    # Inverse square root (transformers' implementation, with its defaults): linear
+    # warmup to --lr over `warmup` steps, then lr = peak * sqrt(warmup / step). It does
+    # not depend on total_steps, so an early stop never cuts a schedule short.
+    from transformers import get_inverse_sqrt_schedule
+    scheduler = get_inverse_sqrt_schedule(optimizer, num_warmup_steps=warmup)
+    return optimizer, scheduler, warmup
+
+
+def resolve_precision(args, device):
+    """Return ``(amp_dtype, scaler)`` for --bf16 / --fp16; ``amp_dtype`` None is fp32.
+
+    bf16 is preferred and is what --bf16 selects: it carries fp32's exponent range (max
+    ~3.4e38 against fp16's 65504), so neither activations nor intermediates in the
+    attention backward overflow, and it needs no GradScaler.
+
+    That last point is the one that matters here. GradScaler responds to ANY non-finite
+    gradient by halving its scale, but it only grows back after 2000 CONSECUTIVE clean
+    steps -- so a sustained non-finite rate above 1/2000 = 0.05% drives the scale
+    monotonically to zero, after which fp16 gradients underflow and every optimizer
+    step becomes a no-op. Observed here: 4 skips/epoch took the scale from 65536 to
+    below 1 in four epochs, at which point a run sitting at ppl 1.7 came apart. Worse,
+    halving cannot fix a non-finite gradient that is not a scaling overflow, and at
+    scale 2 a final gradient would have to exceed 32,752 to be one.
+    """
+    amp_dtype = None
+    if args.bf16 and args.fp16:
+        raise ValueError("pass --bf16 or --fp16, not both")
+    if device.type != "cuda":
+        if args.bf16 or args.fp16:
+            log.warning("Mixed precision requested but no CUDA device; running fp32.")
+    elif args.bf16:
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "--bf16 requested but this GPU does not support bfloat16. Use --fp16, "
+                "and watch the per-epoch 'amp:' line for a falling scaler scale."
+            )
+        amp_dtype = torch.bfloat16
+    elif args.fp16:
+        amp_dtype = torch.float16
+    # A scaler is needed for fp16 only. Under bf16 it would be a no-op at best and a
+    # source of the collapse above at worst.
+    scaler = (torch.cuda.amp.GradScaler() if amp_dtype is torch.float16 else None)
+    log.info("Precision: %s",
+             "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""))
+    return amp_dtype, scaler
+
+
 # ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
-def main(args, wandb_run=None):
-    """Train. *wandb_run*, if given, receives step, epoch and summary metrics."""
+def main(args, wandb_run=None, init_state=None):
+    """Train. *wandb_run*, if given, receives step, epoch and summary metrics.
+
+    *init_state*, if given, is a ``starter.pt`` dict from train_start.py: training
+    continues its model weights, AdamW state and learning-rate schedule instead of
+    starting fresh. train_full.py checks that the two stages are compatible.
+    """
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
@@ -610,7 +721,14 @@ def main(args, wandb_run=None):
     )
 
     # ---- model ----------------------------------------------------
-    model = build_model_from_args(args, vocab_size, pad_id).to(device)
+    model = build_model_from_args(args, vocab_size, pad_id)
+    if init_state is not None:
+        model.load_state_dict(init_state["model"])
+        log.info("Continuing from the starter stage: %d epoch(s) on %s, %d optimizer "
+                 "steps, final val_loss %.4f",
+                 init_state["starter_epochs"], ", ".join(init_state["starter_tasks"]),
+                 init_state["scheduler"]["last_epoch"], init_state["val_loss"])
+    model.to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     log.info("Model: %.1fM params | %s", n_params, model.description)
@@ -623,23 +741,14 @@ def main(args, wandb_run=None):
     train_loader, val_loader = build_dataloaders(args, tokenizer, pad_id)
 
     # ---- optimiser ------------------------------------------------
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay, betas=(0.9, 0.98))
-    # The scheduler counts optimizer steps, not batches, so accumulation divides it.
-    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
-    total_steps = steps_per_epoch * args.epochs
-    warmup = min(args.warmup_steps, total_steps // 10)
-    log.info(
-        "Schedule: %d batches/epoch | accum %d -> %d steps/epoch | %d total | warmup %d "
-        "| effective batch %d",
-        len(train_loader), args.grad_accum, steps_per_epoch, total_steps, warmup,
-        args.batch_size * args.grad_accum,
-    )
-    # Inverse square root (transformers' implementation, with its defaults): linear
-    # warmup to --lr over `warmup` steps, then lr = peak * sqrt(warmup / step). It does
-    # not depend on total_steps, so an early stop never cuts a schedule short.
-    from transformers import get_inverse_sqrt_schedule
-    scheduler = get_inverse_sqrt_schedule(optimizer, num_warmup_steps=warmup)
+    optimizer, scheduler, _ = build_optimizer(
+        args, model, len(train_loader), args.epochs,
+        warmup=init_state["warmup"] if init_state is not None else None)
+    if init_state is not None:
+        # One continuous run: the AdamW moments and the schedule's step count carry
+        # over, so the switch is a change of data and nothing else.
+        optimizer.load_state_dict(init_state["optimizer"])
+        scheduler.load_state_dict(init_state["scheduler"])
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
 
     # Sanity-check the initialisation before spending hours on it. An untrained model
@@ -666,38 +775,8 @@ def main(args, wandb_run=None):
             init_loss / expected,
         )
 
-    # Precision. bf16 is preferred and is what --bf16 selects: it carries fp32's
-    # exponent range (max ~3.4e38 against fp16's 65504), so neither activations nor
-    # intermediates in the attention backward overflow, and it needs no GradScaler.
-    #
-    # That last point is the one that matters here. GradScaler responds to ANY non-finite
-    # gradient by halving its scale, but it only grows back after 2000 CONSECUTIVE clean
-    # steps -- so a sustained non-finite rate above 1/2000 = 0.05% drives the scale
-    # monotonically to zero, after which fp16 gradients underflow and every optimizer
-    # step becomes a no-op. Observed here: 4 skips/epoch took the scale from 65536 to
-    # below 1 in four epochs, at which point a run sitting at ppl 1.7 came apart. Worse,
-    # halving cannot fix a non-finite gradient that is not a scaling overflow, and at
-    # scale 2 a final gradient would have to exceed 32,752 to be one.
-    amp_dtype = None
-    if args.bf16 and args.fp16:
-        raise ValueError("pass --bf16 or --fp16, not both")
-    if device.type != "cuda":
-        if args.bf16 or args.fp16:
-            log.warning("Mixed precision requested but no CUDA device; running fp32.")
-    elif args.bf16:
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError(
-                "--bf16 requested but this GPU does not support bfloat16. Use --fp16, "
-                "and watch the per-epoch 'amp:' line for a falling scaler scale."
-            )
-        amp_dtype = torch.bfloat16
-    elif args.fp16:
-        amp_dtype = torch.float16
+    amp_dtype, scaler = resolve_precision(args, device)
     use_amp = amp_dtype is not None
-    # A scaler is needed for fp16 only. Under bf16 it would be a no-op at best and a
-    # source of the collapse above at worst.
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype is torch.float16)
-    log.info("Precision: %s", "fp32" if not use_amp else str(amp_dtype).replace("torch.", ""))
 
     # ---- output dir -----------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
@@ -729,7 +808,7 @@ def main(args, wandb_run=None):
         train_loss, train_stats = run_epoch(
             model, train_loader, criterion, vocab_size, device,
             optimizer=optimizer, scheduler=scheduler,
-            scaler=scaler if amp_dtype is torch.float16 else None,
+            scaler=scaler,
             amp_dtype=amp_dtype,
             grad_clip=args.grad_clip, log_every=args.log_every,
             lr=args.lr, accum_steps=args.grad_accum,
@@ -889,8 +968,9 @@ def add_model_args(p):
                         "Default --src_len + --tgt_len. Set it to the longest EVAL length "
                         "+ --tgt_len if the model will be evaluated on longer prompts. "
                         "alibi allocates a max_len x max_len mask per layer.")
-    # No size flags: every model uses its library's default hyperparameters
-    # (nn.Transformer, RoFormerConfig, ALiBiConfig). See tmodel/models.py.
+    # No size flags: transformer_mask and alibi use their library's defaults
+    # (nn.Transformer, ALiBiConfig); roformer is sized to match transformer_mask.
+    # See tmodel/models.py.
 
 
 def build_parser():
