@@ -129,13 +129,13 @@ QA_HOLDOUT=2000
 EVAL_SEED=62                # RULER default
 
 # ====================== TRAINING =============================================
-EPOCHS=30
+EPOCHS=25
 BATCH_SIZE=8
 GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 
 # Peak LR. The schedule is inverse square root (train.py): linear warmup to LR over
 # WARMUP optimizer steps, then LR * sqrt(WARMUP / step).
-LR=3e-4
+LR=7e-4
 
 WARMUP=3000
 
@@ -180,8 +180,8 @@ done
 # head, B/C/F; head order carries no meaning, only the count of each code). The decoder
 # is always causal. roformer and alibi carry their own position encoding and no mask.
 TM_PES=("none" "sinusoidal")
-TM_MASKS=("CCCCFFFF" "BBBBBBBB" "CCCCCCCC" "CCCCCCFF")
-OTHER_MODELS=("roformer" "alibi")
+TM_MASKS=("CCCCFFFF" "BBBBBBBB" "CCCCCCCC")
+OTHER_MODELS=("roformer")
 
 for spec in "${TM_MASKS[@]}"; do
     if [ ${#spec} -ne "${TM_NUM_HEADS}" ]; then
