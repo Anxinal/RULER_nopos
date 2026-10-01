@@ -738,7 +738,7 @@ def main(args, wandb_run=None, init_state=None):
         wandb_run.summary["n_params_M"] = n_params
 
     # ---- data -----------------------------------------------------
-    train_loader, val_loader = build_dataloaders(args, tokenizer, pad_id)
+    train_loader, val_loader = build_dataloaders(args, tokenizer, pad_id, tasks=args.tasks)
 
     # ---- optimiser ------------------------------------------------
     optimizer, scheduler, _ = build_optimizer(
@@ -984,6 +984,10 @@ def build_parser():
                    help="'ruler' = JSONL from data/prepare.py; 'text' = HF dataset")
     g.add_argument("--data_dir", default=None,
                    help="Root dir with RULER JSONL files (for --data_format ruler)")
+    g.add_argument("--tasks", nargs="+", default=None,
+                   help="RULER task directories under --data_dir to train on; each must "
+                        "exist. Default: every task found. One data root can then serve "
+                        "several task lists, e.g. the starter and full curriculum stages.")
     g.add_argument("--tokenizer", default="gpt2")
     g.add_argument("--dataset", default="wikitext",
                    help="HuggingFace dataset name (for --data_format text)")

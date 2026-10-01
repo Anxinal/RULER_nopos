@@ -15,25 +15,18 @@ the learning-rate schedule and its warmup -- to ``--output_dir``. ``train_full.p
 continues from that file on the full task set, so the two stages together are one run
 whose training data changes at the switch.
 
-``--data_dir`` must contain the starter tasks. The full stage trains on every task under
-its own ``--data_dir``, so generate ``niah_single_2`` into a separate root rather than
-into the full-suite one, e.g.::
-
-    python scripts/data/prepare.py --save_dir train_data_starter/2048/data \\
-        --benchmark synthetic --task niah_single_2 --tokenizer_path gpt2 \\
-        --tokenizer_type hf --max_seq_length 2048 --model_template_type base \\
-        --num_samples 32000 --random_seed <TRAIN_SEED>
-
-(and the same for niah_single_1 and vt, or copy their directories over).
+Both stages read the same ``--data_dir``, which holds every task of either stage, and
+each loads only its own list: ``--starter_tasks`` here, ``--tasks`` in the full stage.
+run_seed_experiments.sh generates the union and runs both stages per cell.
 
 Usage
 -----
-    python train_start.py --data_dir train_data_starter/2048/data \\
-        --model transformer_mask --encoder_mask CCCCFFFF --starter_epochs 3 \\
+    python train_start.py --data_dir train_data/2048/data \\
+        --model transformer_mask --encoder_mask CCCCFFFF --starter_epochs 4 --lr 1.5e-4 \\
         --output_dir experiments/tm_CCCCFFFF_s42 --bf16
     python train_full.py --init_from experiments/tm_CCCCFFFF_s42/starter.pt \\
-        --data_dir train_data/2048/data --model transformer_mask \\
-        --encoder_mask CCCCFFFF --output_dir experiments/tm_CCCCFFFF_s42 --bf16
+        --data_dir train_data/2048/data --tasks <TRAIN_TASKS> --model transformer_mask \\
+        --encoder_mask CCCCFFFF --lr 1.5e-4 --output_dir experiments/tm_CCCCFFFF_s42 --bf16
 """
 
 import json
@@ -69,8 +62,13 @@ def main(args, wandb_run=None):
 
     train_loader, val_loader = train.build_dataloaders(args, tokenizer, pad_id,
                                                        tasks=args.starter_tasks)
+    # Warmup is set in starter epochs, not --warmup_steps: build_optimizer would cap a
+    # step count at a tenth of this short stage, and an epoch count stays right if the
+    # batch size or the sample count changes. train_full.py inherits this value.
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     optimizer, scheduler, warmup = train.build_optimizer(
-        args, model, len(train_loader), args.starter_epochs)
+        args, model, len(train_loader), args.starter_epochs,
+        warmup=max(1, round(args.starter_warmup_epochs * steps_per_epoch)))
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
     amp_dtype, scaler = train.resolve_precision(args, device)
 
@@ -129,8 +127,11 @@ def main(args, wandb_run=None):
 def add_starter_args(p):
     """Flags for the starter stage, on top of every train.py flag."""
     g = p.add_argument_group("starter curriculum")
-    g.add_argument("--starter_epochs", type=int, default=3,
+    g.add_argument("--starter_epochs", type=int, default=4,
                    help="Epochs over the starter tasks before train_full.py takes over.")
+    g.add_argument("--starter_warmup_epochs", type=float, default=2.0,
+                   help="Learning-rate warmup, in starter epochs. Replaces --warmup_steps "
+                        "for both stages: train_full.py continues this schedule.")
     g.add_argument("--starter_tasks", nargs="+", default=list(STARTER_TASKS),
                    help="Task directories under --data_dir to train on. Each must exist.")
 

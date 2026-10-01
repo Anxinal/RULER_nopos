@@ -5,17 +5,19 @@
 # Seed sweep on the RULER benchmark: every arm below is trained and evaluated with
 # each of SEEDS, one Slurm job per (arm, seed).
 #
-# Arms (10):
-#   transformer_mask (maskedVanilla, encoder-decoder), pe x encoder mask:
-#       pe   in {none, sinusoidal}
-#       mask in {CCCCFFFF, BBBBBBBB, CCCCCCCC, CCCCCCFF}
+# Arms (4), see TM_ARMS / OTHER_MODELS:
+#   transformer_mask (maskedVanilla, encoder-decoder):
+#       pe none,       mask CCCCFFFF
+#       pe none,       mask CCCCCCCC
+#       pe sinusoidal, mask BBBBBBBB   (vanilla transformer, no mask)
 #   roformer  (decoder-only, RoPE)
-#   alibi     (decoder-only, ALiBi)
-# Every model uses its library's default hyperparameters (see tmodel/models.py).
+# transformer_mask uses nn.Transformer defaults; roformer is sized to match it
+# (see tmodel/models.py).
 #
 # Pipeline (per arm and seed):
 #   1. Generate RULER training data   (scripts/data/prepare.py, once, shared)
-#   2. Train with wandb tracking       (train_wandb.py -> train.py)
+#   2. Train with wandb tracking       (train_wandb.py: starter stage on STARTER_TASKS,
+#                                       then the full stage on TRAIN_TASKS)
 #   3. Generate RULER eval data       (scripts/data/prepare.py, once, shared)
 #   4. Run predictions                (scripts/pred/call_api.py --server_type tmodel)
 #   5. Compute metrics                (scripts/eval/evaluate.py)
@@ -135,9 +137,13 @@ GRAD_ACCUM=8                # effective batch = BATCH_SIZE * GRAD_ACCUM
 
 # Peak LR. The schedule is inverse square root (train.py): linear warmup to LR over
 # WARMUP optimizer steps, then LR * sqrt(WARMUP / step).
-LR=7e-4
+LR=1.5e-4
 
-WARMUP=3000
+# ~2 starter epochs: the starter stage (niah_single_1, niah_single_2, vt) is 3 tasks x
+# TRAIN_SAMPLES x 0.9 for training = 86,400 samples = 1,350 optimizer steps per epoch at
+# an effective batch of 64. train_start.py sets its own warmup as --starter_warmup_epochs
+# (default 2), which tracks these sizes if they change; this value is for train.py runs.
+WARMUP=2700
 
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
@@ -176,14 +182,20 @@ for arg in "$@"; do
 done
 
 # ====================== EXPERIMENT GRID ======================================
-# transformer_mask arms: every pe crossed with every encoder mask spec (one code per
-# head, B/C/F; head order carries no meaning, only the count of each code). The decoder
-# is always causal. roformer and alibi carry their own position encoding and no mask.
-TM_PES=("none" "sinusoidal")
-TM_MASKS=("CCCCFFFF" "BBBBBBBB" "CCCCCCCC")
+# transformer_mask arms, as explicit "<pe> <encoder mask>" pairs rather than a pe x mask
+# cross product. The mask spec is one code per head, B/C/F; head order carries no
+# meaning, only the count of each code. The decoder is always causal.
+#
+#   none       CCCCFFFF   no position encoding, 4 causal + 4 future-only heads
+#   none       CCCCCCCC   no position encoding, all heads causal
+#   sinusoidal BBBBBBBB   the vanilla transformer: sinusoidal PE, no mask
+#
+# roformer carries its own position encoding (RoPE) and no mask.
+TM_ARMS=("none CCCCFFFF" "none CCCCCCCC" "sinusoidal BBBBBBBB")
 OTHER_MODELS=("roformer")
 
-for spec in "${TM_MASKS[@]}"; do
+for arm in "${TM_ARMS[@]}"; do
+    spec="${arm#* }"
     if [ ${#spec} -ne "${TM_NUM_HEADS}" ]; then
         echo "ERROR: mask spec '${spec}' has ${#spec} codes but transformer_mask has ${TM_NUM_HEADS} heads." >&2
         exit 1
@@ -204,10 +216,8 @@ exp_name() {
 # the queue holds one complete replicate of every arm before the next seed starts.
 EXPERIMENTS=()
 for seed in "${SEEDS[@]}"; do
-    for pe in "${TM_PES[@]}"; do
-        for spec in "${TM_MASKS[@]}"; do
-            EXPERIMENTS+=("transformer_mask ${pe} ${spec} ${seed}")
-        done
+    for arm in "${TM_ARMS[@]}"; do
+        EXPERIMENTS+=("transformer_mask ${arm} ${seed}")
     done
     for model in "${OTHER_MODELS[@]}"; do
         EXPERIMENTS+=("${model} - - ${seed}")
@@ -311,14 +321,32 @@ TRAIN_TASKS=("niah_single_1" "niah_single_3" "vt" "vt_2chain"
 EVAL_TASKS=("vt_2chain" "vt_4chain"
             "niah_multikey_1" "niah_multikey_2" "niah_multikey_3")
 
-# Union, order preserving. Nothing outside this loop should iterate both lists.
-ALL_TASKS=()
-for _t in "${TRAIN_TASKS[@]}" "${EVAL_TASKS[@]}"; do
-    case " ${ALL_TASKS[*]:-} " in
-        *" ${_t} "*) ;;
-        *) ALL_TASKS+=("${_t}") ;;
-    esac
-done
+# Starter curriculum. Each cell first trains STARTER_EPOCHS epochs on STARTER_TASKS only
+# (train_start.py), then continues the same model, AdamW state and LR schedule on
+# TRAIN_TASKS (train_full.py) for up to EPOCHS. Every task of both lists is generated
+# into the one TRAIN_DATA_DIR, and each stage loads only its own list (--starter_tasks /
+# --tasks), so niah_single_2 is seen in the starter stage and never after it. LR warmup
+# is STARTER_WARMUP_EPOCHS starter epochs; WARMUP applies only when STARTER_EPOCHS=0,
+# which trains every cell from scratch on TRAIN_TASKS instead.
+STARTER_TASKS=("niah_single_1" "niah_single_2" "vt")
+STARTER_EPOCHS="${STARTER_EPOCHS:-4}"
+STARTER_WARMUP_EPOCHS="${STARTER_WARMUP_EPOCHS:-2}"
+
+# Union of the task lists, order preserving; nothing outside these loops should
+# iterate several lists. TRAIN_DATA_TASKS is what gets generated for training.
+_union() {
+    local out=() t
+    for t in "$@"; do
+        case " ${out[*]:-} " in *" ${t} "*) ;; *) out+=("${t}") ;; esac
+    done
+    echo "${out[@]}"
+}
+if [ "${STARTER_EPOCHS}" -gt 0 ]; then
+    read -r -a TRAIN_DATA_TASKS <<< "$(_union "${TRAIN_TASKS[@]}" "${STARTER_TASKS[@]}")"
+else
+    TRAIN_DATA_TASKS=("${TRAIN_TASKS[@]}")
+fi
+read -r -a ALL_TASKS <<< "$(_union "${TRAIN_DATA_TASKS[@]}" "${EVAL_TASKS[@]}")"
 
 case "${PRECISION}" in
     bf16|fp16) ;;
@@ -336,19 +364,26 @@ done
 # Print the split rather than validate it. With two independent lists there is no
 # illegal combination left to detect -- train-only and eval-only are both intended --
 # but a task landing on the wrong side is silent and costs a whole run, so name each.
-_both=() _train_only=() _eval_only=()
+_both=() _train_only=() _eval_only=() _starter_only=()
 for _t in "${ALL_TASKS[@]}"; do
     case " ${TRAIN_TASKS[*]} " in *" ${_t} "*) _in_train=true ;; *) _in_train=false ;; esac
     case " ${EVAL_TASKS[*]} "  in *" ${_t} "*) _in_eval=true  ;; *) _in_eval=false  ;; esac
     if   $_in_train && $_in_eval; then _both+=("${_t}")
     elif $_in_train;              then _train_only+=("${_t}")
-    else                               _eval_only+=("${_t}")
+    elif $_in_eval;               then _eval_only+=("${_t}")
+    else                               _starter_only+=("${_t}")
     fi
 done
 echo "Tasks: ${#ALL_TASKS[@]} total"
 echo "  trained and scored  : ${_both[*]:-none}"
 echo "  train only (curric) : ${_train_only[*]:-none}"
 echo "  eval only (held out): ${_eval_only[*]:-none}"
+if [ "${STARTER_EPOCHS}" -gt 0 ]; then
+    echo "  starter stage       : ${STARTER_TASKS[*]} for ${STARTER_EPOCHS} epoch(s)" \
+         "(only there: ${_starter_only[*]:-none})"
+else
+    echo "  starter stage       : off (STARTER_EPOCHS=0)"
+fi
 
 # ====================== PATHS ================================================
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/../experiments}"
@@ -702,10 +737,10 @@ generate_train_data() {
     for SEQ_LEN in "${TRAIN_SEQ_LENGTHS[@]}"; do
         DATA_DIR="${TRAIN_DATA_DIR}/${SEQ_LEN}/data"
         mkdir -p "${DATA_DIR}"
-        # TRAIN_TASKS, not ALL_TASKS. train.py globs this whole tree recursively, so
-        # an eval-only task generated here would be trained on regardless of what the
-        # task lists say. This is what actually enforces the split.
-        for TASK in "${TRAIN_TASKS[@]}"; do
+        # TRAIN_DATA_TASKS (train + starter), never an eval-only task. Each stage also
+        # filters to its own list, but an eval task generated here with the TRAIN seed
+        # would be one flag away from leaking into training.
+        for TASK in "${TRAIN_DATA_TASKS[@]}"; do
             python "${SCRIPT_DIR}/data/prepare.py" \
                 --save_dir   "${DATA_DIR}" \
                 --benchmark  synthetic \
@@ -746,14 +781,37 @@ PYCAP
 }
 
 # ====================== PER-EXPERIMENT JOB ====================================
-# Fills TRAIN_CMD with the training command for one cell. Shared by run_experiment and
-# --dry-run, so what the dry run prints is exactly what a job runs.
+# The training stages each cell runs, in order: the starter curriculum (starter, then
+# full) or, with STARTER_EPOCHS=0, a single from-scratch run.
+train_stages() {
+    if [ "${STARTER_EPOCHS}" -gt 0 ]; then echo "starter full"; else echo "scratch"; fi
+}
+
+# Fills TRAIN_CMD with the command for one stage of one cell. Shared by run_experiment
+# and --dry-run, so what the dry run prints is exactly what a job runs.
 train_command() {
-    local model="$1" pe="$2" enc_mask="$3" seed="$4"
+    local model="$1" pe="$2" enc_mask="$3" seed="$4" stage="$5"
     local EXP_NAME; EXP_NAME="$(exp_name "${model}" "${pe}" "${enc_mask}" "${seed}")"
     TRAIN_CMD=(python "${TRAIN_SCRIPT}"
+        --stage        "${stage}"
         --model        "${model}")
-    local tags=("model:${model}" "seed:${seed}")
+    local tags=("model:${model}" "seed:${seed}" "stage:${stage}")
+    local run_name="${EXP_NAME}"
+    if [ "${stage}" = "starter" ]; then run_name+="-starter"; fi
+    case "${stage}" in
+        starter)
+            TRAIN_CMD+=(--starter_tasks "${STARTER_TASKS[@]}"
+                        --starter_epochs "${STARTER_EPOCHS}"
+                        --starter_warmup_epochs "${STARTER_WARMUP_EPOCHS}")
+            ;;
+        full)
+            TRAIN_CMD+=(--init_from "${EXP_ROOT}/${EXP_NAME}/starter.pt"
+                        --tasks "${TRAIN_TASKS[@]}")
+            ;;
+        scratch)
+            TRAIN_CMD+=(--tasks "${TRAIN_TASKS[@]}")
+            ;;
+    esac
     if [ "${model}" = "transformer_mask" ]; then
         TRAIN_CMD+=(--pe "${pe}" --encoder_mask "${enc_mask}")
         tags+=("pe:${pe}" "mask:${enc_mask}")
@@ -779,7 +837,7 @@ train_command() {
         --output_dir   "${EXP_ROOT}/${EXP_NAME}"
         --project      "${WANDB_PROJECT}"
         --group        "${WANDB_GROUP}"
-        --run_name     "${EXP_NAME}"
+        --run_name     "${run_name}"
         --tags         "${tags[@]}"
         --mode         "${WANDB_MODE}")
     if [ -n "${WANDB_ENTITY}" ]; then
@@ -817,8 +875,18 @@ import torch; c = torch.load('${CKPT}', map_location='cpu', weights_only=False)
 print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val_loss',float('nan')):.4f}\")"
         fi
     else
-    train_command "${model}" "${pe}" "${enc_mask}" "${seed}"
-    "${TRAIN_CMD[@]}"
+        local stage
+        for stage in $(train_stages); do
+            # starter.pt is written once, after the last starter epoch, so finding it
+            # means the starter stage finished; a resubmitted job goes straight on.
+            if [ "${stage}" = "starter" ] && ! $RETRAIN && [ -f "${EXP_DIR}/starter.pt" ]; then
+                echo "--- Reusing ${EXP_DIR}/starter.pt (starter stage already completed) ---"
+                continue
+            fi
+            echo "--- Training: ${stage} stage ---"
+            train_command "${model}" "${pe}" "${enc_mask}" "${seed}" "${stage}"
+            "${TRAIN_CMD[@]}"
+        done
     fi
 
     # ---- Phase 2: Evaluate at each RULER sequence length ------------------
@@ -858,7 +926,8 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
     # here is safe because 'set -e' aborts before this line if any eval failed, so a
     # checkpoint is only removed once its results exist.
     if ! $KEEP_CHECKPOINTS; then
-        rm -f "${CKPT}" "${EXP_DIR}/last.pt"
+        # starter.pt too: it carries the AdamW state, so it is ~3x the size of best.pt.
+        rm -f "${CKPT}" "${EXP_DIR}/last.pt" "${EXP_DIR}/starter.pt"
         echo "    removed checkpoint (KEEP_CHECKPOINTS=false); results are in ${EXP_ROOT}/results/${EXP_NAME}"
     fi
 
@@ -897,7 +966,7 @@ set -euo pipefail
 # Variables first: setup_env reads VENV_DIR and friends, and under 'set -u'
 # referencing them before they are declared aborts the job immediately.
 $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC SCRIPT_DIR CORPUS_DIR TOKENIZER ALL_TASKS TRAIN_TASKS EVAL_TASKS \
-             TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
+             TRAIN_DATA_TASKS TRAIN_DATA_DIR TRAIN_SEQ_LENGTHS TRAIN_SAMPLES TRAIN_SEED \
              EVAL_DATA_ROOT EVAL_SEQ_LENGTHS EVAL_SAMPLES EVAL_SEED QA_HOLDOUT)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
@@ -938,9 +1007,11 @@ for cell in "${EXPERIMENTS[@]}"; do
     fi
 
     if $DRY_RUN; then
-        train_command "${model}" "${pe}" "${enc_mask}" "${seed}"
         echo "[dry-run] ${EXP_NAME}"
-        printf '    %q' "${TRAIN_CMD[@]}"; echo
+        for stage in $(train_stages); do
+            train_command "${model}" "${pe}" "${enc_mask}" "${seed}" "${stage}"
+            printf '    %q' "${TRAIN_CMD[@]}"; echo
+        done
         n_jobs=$((n_jobs + 1))
         continue
     fi
@@ -976,6 +1047,7 @@ $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT MAX_LEN TOKENIZ
              SRC_LEN TGT_LEN EPOCHS BATCH_SIZE GRAD_ACCUM LR WARMUP PRECISION \
              EVAL_SEQ_LENGTHS EVAL_SAMPLES EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA \
              EARLY_STOP_MIN_EPOCHS DROPOUT EVAL_SEED QA_HOLDOUT EVAL_TASKS \
+             TRAIN_TASKS STARTER_TASKS STARTER_EPOCHS STARTER_WARMUP_EPOCHS \
              REPO_DIR SCRIPT_DIR WANDB_PROJECT WANDB_ENTITY WANDB_GROUP WANDB_MODE)
 $(declare -f setup_env)
 $(declare -f _missing_packages)
@@ -984,6 +1056,7 @@ $(declare -f check_environment)
 $(declare -f check_gpu)
 $(declare -f answer_token_cap)
 $(declare -f exp_name)
+$(declare -f train_stages)
 $(declare -f train_command)
 $(declare -f run_experiment)
 
