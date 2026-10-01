@@ -1,32 +1,3 @@
-"""Train a MaskedTransformer on RULER synthetic data or plain text.
-
-Data formats
-------------
-* ``--data_format ruler``  (recommended for RULER experiments)
-    Reads JSONL files produced by ``data/prepare.py``.  Each sample has a
-    long ``input`` (encoder source) and short ``outputs`` (decoder target).
-    Pass ``--data_dir`` pointing to the root that contains the generated
-    ``*/data/*/validation.jsonl`` tree.
-
-* ``--data_format text``
-    Language-modelling on a HuggingFace dataset (e.g. WikiText-103).
-    Source = token chunk, target = next chunk.
-
-Usage
------
-    # Train on RULER data
-    python scripts/tmodel/train.py \\
-        --data_format ruler --data_dir experiments/train_data \\
-        --pe_type rope --encoder_mask CCCCFFFF \\
-        --output_dir experiments/pe_rope_encCCCCFFFF
-
-    # Train on WikiText
-    python scripts/tmodel/train.py \\
-        --data_format text --dataset wikitext --dataset_subset wikitext-103-raw-v1 \\
-        --pe_type sinusoidal --output_dir experiments/pe_sin_lm
-
-Dependencies: torch, transformers   (+ datasets for --data_format text)
-"""
 
 import argparse
 import collections
@@ -46,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 # Resolve package path so `from tmodel import …` works regardless of cwd.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_SCRIPT_DIR, ".."))
-from tmodel import MaskedTransformer  # noqa: E402
+from tmodel.maskedVanilla import MaskedTransformer  # noqa: E402
 
 # stream=sys.stdout explicitly: logging.basicConfig defaults to stderr, which under
 # Slurm sends the whole training log to the .err file while the evaluation steps,
@@ -283,22 +254,18 @@ RECENT_WINDOW = 200
 
 # Consecutive zero-gradient optimizer steps tolerated before the run is declared dead.
 #
-# Under AMP this is the terminal state of a diverged run, and it is silent: the loss is
-# still finite (so the non-finite guard never fires), but the gradient scaler has backed
-# off so far that fp16 gradients underflow to zero in backward. unscale_ then turns zero
-# into zero, no inf is found, and scaler.step applies a ZERO update -- forever. Observed
-# in practice as `gnorm 0.00` for thousands of batches at loss ~17, burning GPU on a
-# model that cannot move. GradScaler only retries growing the scale every 2000 steps, so
-# waiting it out is not a strategy either.
+# A zero gradient with a finite loss is silent: the non-finite guard never fires, and
+# every optimizer step is a no-op. Observed in practice as `gnorm 0.00` for thousands of
+# batches at loss ~17, burning GPU on a model that cannot move.
 #
 # 50 steps is comfortably more than any transient: a healthy run never produces two in a
 # row, because a zero gradient over a whole accumulation group means every micro-batch
-# underflowed.
+# produced nothing.
 MAX_ZERO_GRAD_STEPS = 50
 
 
 def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
-              scheduler=None, scaler=None, grad_clip=1.0, log_every=100, lr=0,
+              scheduler=None, grad_clip=1.0, log_every=100, lr=0,
               accum_steps=1, amp_dtype=None):
     """Run one training or validation epoch.  Pass *optimizer=None* for eval.
 
@@ -322,9 +289,7 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
     model.train(is_train)
     total_loss = 0.0
     total_tokens = 0
-    # Autocast is driven by amp_dtype, NOT by the presence of a scaler. bf16 wants
-    # autocast with no scaler at all: it has fp32's exponent range, so there is nothing
-    # to scale away from and no scale that could collapse.
+    # bf16 autocast needs no GradScaler: it has fp32's exponent range.
     use_amp = amp_dtype is not None
     n_batches = len(loader)
     spike_threshold = LOSS_SPIKE_FACTOR * math.log(vocab_size)
@@ -332,8 +297,7 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
     recent = collections.deque(maxlen=RECENT_WINDOW)   # (loss, n_tok) per finite batch
     stats = dict(n_nonfinite=0, n_spikes=0, max_loss=float("-inf"),
                  first_nonfinite_step=None, last_grad_norm=float("nan"),
-                 n_opt_steps=0, n_skipped_steps=0, n_zero_grad=0,
-                 scale=float("nan"))
+                 n_opt_steps=0, n_zero_grad=0)
     grad_norm = float("nan")
     zero_grad_streak = 0
 
@@ -358,9 +322,9 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
         # so a single NaN makes every later log line, the epoch loss and the val loss NaN
         # for good -- and a NaN val loss never satisfies `val_loss < best_val`, so the run
         # goes on to finish without ever writing best.pt and the whole cell is lost.
-        # Backward is skipped too: the gradients would be NaN throughout, and with AMP the
-        # scaler would discard the entire accumulation group, including the batches either
-        # side of this one that were perfectly fine.
+        # Backward is skipped too: the gradients would be NaN throughout and would poison
+        # the entire accumulation group, including the batches either side of this one
+        # that were perfectly fine.
         if not math.isfinite(loss_val):
             stats["n_nonfinite"] += 1
             if stats["first_nonfinite_step"] is None:
@@ -390,30 +354,12 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
 
         if is_train:
             # Scale down so accumulated gradients average rather than sum.
-            scaled_loss = loss / accum_steps
-            if scaler:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            (loss / accum_steps).backward()
 
             is_last_batch = step == n_batches
             if step % accum_steps == 0 or is_last_batch:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    # GradScaler halves its scale exactly when unscale_ found a non-finite
-                    # gradient, and that is also when it skips the step -- so comparing the
-                    # scale across update() is how a skipped step is detected without
-                    # touching private attributes.
-                    scale_before = scaler.get_scale()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    stats["scale"] = scaler.get_scale()
-                    if stats["scale"] < scale_before:
-                        stats["n_skipped_steps"] += 1
-                else:
-                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    optimizer.step()
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
                 grad_norm = float(grad_norm)
                 stats["last_grad_norm"] = grad_norm
                 stats["n_opt_steps"] += 1
@@ -427,17 +373,14 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                     zero_grad_streak += 1
                     if zero_grad_streak == 1:
                         log.warning(
-                            "  step %d: gradient norm is exactly 0 (loss %.4f, scaler "
-                            "scale %s). If this persists the scaler has collapsed and no "
-                            "learning is happening.", step, loss_val, stats["scale"])
+                            "  step %d: gradient norm is exactly 0 (loss %.4f). If this "
+                            "persists no learning is happening.", step, loss_val)
                     if zero_grad_streak >= MAX_ZERO_GRAD_STEPS:
                         raise RuntimeError(
                             f"{zero_grad_streak} consecutive optimizer steps had a "
                             f"gradient norm of exactly 0 while the loss was "
-                            f"{loss_val:.4f} (scaler scale {stats['scale']}). The "
-                            f"gradient scaler has backed off far enough that gradients "
-                            f"underflow to zero, so every step is a no-op. Training "
-                            f"cannot recover; stopping instead of burning the time limit."
+                            f"{loss_val:.4f}, so every step is a no-op. Stopping instead "
+                            f"of burning the time limit."
                         )
                 else:
                     zero_grad_streak = 0
@@ -459,14 +402,8 @@ def run_epoch(model, loader, criterion, vocab_size, device, optimizer=None,
                     "gnorm %.2f | lr %.2e%s",
                     step, n_batches, avg, len(recent), win, math.exp(min(win, 20)),
                     grad_norm, cur_lr,
-                    # %g, not %.0f: a collapsing scale passes through 0.5, 0.25, ...
-                    # and %.0f printed every one of those as "0".
-                    (f" | scale {stats['scale']:g}"
-                     if math.isfinite(stats["scale"]) else "")
-                    + (f" | {stats['n_skipped_steps']} step(s) skipped"
-                       if stats["n_skipped_steps"] else "")
-                    + (f" | SKIPPED {stats['n_nonfinite']} non-finite batch(es)"
-                       if stats["n_nonfinite"] else ""),
+                    (f" | SKIPPED {stats['n_nonfinite']} non-finite batch(es)"
+                     if stats["n_nonfinite"] else ""),
                 )
 
     if total_tokens == 0:
@@ -620,38 +557,16 @@ def main(args):
             init_loss / expected,
         )
 
-    # Precision. bf16 is preferred and is what --bf16 selects: it carries fp32's
-    # exponent range (max ~3.4e38 against fp16's 65504), so neither activations nor
-    # intermediates in the attention backward overflow, and it needs no GradScaler.
-    #
-    # That last point is the one that matters here. GradScaler responds to ANY non-finite
-    # gradient by halving its scale, but it only grows back after 2000 CONSECUTIVE clean
-    # steps -- so a sustained non-finite rate above 1/2000 = 0.05% drives the scale
-    # monotonically to zero, after which fp16 gradients underflow and every optimizer
-    # step becomes a no-op. Observed here: 4 skips/epoch took the scale from 65536 to
-    # below 1 in four epochs, at which point a run sitting at ppl 1.7 came apart. Worse,
-    # halving cannot fix a non-finite gradient that is not a scaling overflow, and at
-    # scale 2 a final gradient would have to exceed 32,752 to be one.
+    # Precision: bf16 autocast under --bf16, fp32 otherwise.
     amp_dtype = None
-    if args.bf16 and args.fp16:
-        raise ValueError("pass --bf16 or --fp16, not both")
-    if device.type != "cuda":
-        if args.bf16 or args.fp16:
-            log.warning("Mixed precision requested but no CUDA device; running fp32.")
-    elif args.bf16:
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError(
-                "--bf16 requested but this GPU does not support bfloat16. Use --fp16, "
-                "and watch the per-epoch 'amp:' line for a falling scaler scale."
-            )
-        amp_dtype = torch.bfloat16
-    elif args.fp16:
-        amp_dtype = torch.float16
-    use_amp = amp_dtype is not None
-    # A scaler is needed for fp16 only. Under bf16 it would be a no-op at best and a
-    # source of the collapse above at worst.
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype is torch.float16)
-    log.info("Precision: %s", "fp32" if not use_amp else str(amp_dtype).replace("torch.", ""))
+    if args.bf16:
+        if device.type != "cuda":
+            log.warning("--bf16 requested but no CUDA device; running fp32.")
+        elif not torch.cuda.is_bf16_supported():
+            raise RuntimeError("--bf16 requested but this GPU does not support bfloat16.")
+        else:
+            amp_dtype = torch.bfloat16
+    log.info("Precision: %s", "bf16" if amp_dtype else "fp32")
 
     # ---- output dir -----------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
@@ -683,7 +598,6 @@ def main(args):
         train_loss, train_stats = run_epoch(
             model, train_loader, criterion, vocab_size, device,
             optimizer=optimizer, scheduler=scheduler,
-            scaler=scaler if amp_dtype is torch.float16 else None,
             amp_dtype=amp_dtype,
             grad_clip=args.grad_clip, log_every=args.log_every,
             lr=args.lr, accum_steps=args.grad_accum)
@@ -705,20 +619,9 @@ def main(args):
                  train_stats["n_spikes"], train_stats["n_nonfinite"],
                  f" (first at step {train_stats['first_nonfinite_step']})"
                  if train_stats["n_nonfinite"] else "")
-        # AMP health, separate from loss health. A rising skip count with a falling scale
-        # is the scaler backing off, which precedes the zero-gradient collapse; both are
-        # invisible in the loss, which stays finite throughout.
-        if use_amp:
-            # Under bf16 there is no scale to report, but the skipped/zero-gradient
-            # counts still matter: they are now the only way a non-finite gradient shows
-            # up at all, since nothing backs off in response to one.
-            scale_note = (f" | scaler scale {train_stats['scale']:g}"
-                          if math.isfinite(train_stats["scale"]) else "")
-            log.info("  amp: %d optimizer step(s), %d skipped for non-finite grads "
-                     "(%.2f%%), %d with zero gradient%s",
-                     train_stats["n_opt_steps"], train_stats["n_skipped_steps"],
-                     100.0 * train_stats["n_skipped_steps"] / max(train_stats["n_opt_steps"], 1),
-                     train_stats["n_zero_grad"], scale_note)
+        # Zero-gradient steps are invisible in the loss, which stays finite throughout.
+        log.info("  optim: %d optimizer step(s), %d with zero gradient",
+                 train_stats["n_opt_steps"], train_stats["n_zero_grad"])
         if val_stats["n_nonfinite"]:
             log.warning("  val: %d non-finite batch(es) excluded from val_loss; the "
                         "checkpoint decision below is made on the rest",
@@ -769,9 +672,7 @@ def main(args):
                                     train_nonfinite=train_stats["n_nonfinite"],
                                     val_nonfinite=val_stats["n_nonfinite"],
                                     opt_steps=train_stats["n_opt_steps"],
-                                    skipped_steps=train_stats["n_skipped_steps"],
-                                    zero_grad_steps=train_stats["n_zero_grad"],
-                                    scaler_scale=train_stats["scale"])) + "\n")
+                                    zero_grad_steps=train_stats["n_zero_grad"])) + "\n")
 
         if args.early_stop_patience > 0 and stale >= args.early_stop_patience:
             # The floor exists because "flat" does not always mean "finished". An arm
@@ -882,15 +783,9 @@ def parse_args():
     g.add_argument("--min_lr_frac", type=float, default=0.0,
                    help="Floor the cosine schedule at this fraction of the peak LR "
                         "instead of decaying to zero. See cosine_with_warmup.")
-    g.add_argument("--fp16", action="store_true",
-                   help="Mixed precision in float16, with a GradScaler. Prefer --bf16: "
-                        "fp16's 65504 ceiling makes the scaler back off, and it only "
-                        "recovers after 2000 consecutive clean steps, so a sustained "
-                        "non-finite rate above 0.05% drives the scale to zero and "
-                        "training silently becomes a no-op.")
     g.add_argument("--bf16", action="store_true",
-                   help="Mixed precision in bfloat16 (no GradScaler needed). Requires a "
-                        "GPU with bf16 support; Ampere and later, including H100.")
+                   help="Mixed precision in bfloat16. Requires a GPU with bf16 support; "
+                        "Ampere and later, including H100.")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--workers", type=int, default=4)
     g.add_argument("--log_every", type=int, default=100)
