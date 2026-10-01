@@ -215,11 +215,21 @@ class DecoderOnlyLM(TokenLM):
 class RoFormerLM(DecoderOnlyLM):
     """``RoFormerForCausalLM`` from ``tmodel.roformer`` (rotary position embeddings).
 
-    Uses ``RoFormerConfig``'s defaults (768 wide, 12 heads, 12 layers, feed-forward
-    3072, dropout 0.1). Only what the data or the decoder-only setup requires is set:
+    Sized to match ``transformer_mask`` rather than ``RoFormerConfig``'s defaults (768
+    wide, 12 layers, ff 3072: 85.7M parameters outside the vocabulary matrix, about
+    twice transformer_mask's 44.2M). It keeps transformer_mask's width -- 512 wide,
+    8 heads of 64, ff 2048 -- and takes 14 layers, which gives 44.4M outside the
+    vocabulary matrix. The total is ~70M against transformer_mask's ~96M only because
+    RoFormer ties its input and output embeddings and transformer_mask does not.
+    Beyond the sizes, only what the data or the decoder-only setup requires is set:
     the vocabulary, the pad id, ``is_decoder`` (for the causal mask) and ``max_len``,
     plus ``dropout`` when overridden.
     """
+
+    HIDDEN_SIZE = 512
+    NUM_HEADS = 8
+    NUM_LAYERS = 14
+    FF_SIZE = 2048
 
     def __init__(self, vocab_size: int, pad_token_id: int, max_len: int,
                  dropout: float | None = None):
@@ -234,9 +244,17 @@ class RoFormerLM(DecoderOnlyLM):
                           dict(hidden_dropout_prob=dropout, attention_probs_dropout_prob=dropout))
         config = RoFormerConfig(vocab_size=vocab_size, pad_token_id=pad_token_id,
                                 max_position_embeddings=max_len, is_decoder=True,
-                                use_cache=False, **dropout_kwargs)
+                                use_cache=False,
+                                hidden_size=self.HIDDEN_SIZE,
+                                # Explicit, so the embeddings can never differ from
+                                # hidden_size and pick up an extra projection layer.
+                                embedding_size=self.HIDDEN_SIZE,
+                                num_attention_heads=self.NUM_HEADS,
+                                num_hidden_layers=self.NUM_LAYERS,
+                                intermediate_size=self.FF_SIZE,
+                                **dropout_kwargs)
         self.model = RoFormerForCausalLM(config)
-        self.description = (f"roformer (decoder-only, RoPE) | RoFormerConfig defaults: "
+        self.description = (f"roformer (decoder-only, RoPE) | sized to transformer_mask: "
                             f"{config.hidden_size} wide, {config.num_attention_heads} heads, "
                             f"{config.num_hidden_layers} layers, ff {config.intermediate_size}, "
                             f"dropout {config.hidden_dropout_prob} | max_len={max_len}")
@@ -289,9 +307,10 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
                 dropout: float | None = None) -> TokenLM:
     """Build one of :data:`MODEL_TYPES` with the shared ``model(src, tgt_in)`` interface.
 
-    Every model uses its own library's default hyperparameters: ``nn.Transformer``'s for
-    ``transformer_mask``, ``RoFormerConfig``'s for ``roformer`` and ``ALiBiConfig``'s for
-    ``alibi``. The only arguments are what the data dictates:
+    ``transformer_mask`` and ``alibi`` use their library's default hyperparameters
+    (``nn.Transformer``'s and ``ALiBiConfig``'s); ``roformer`` is sized to match
+    ``transformer_mask`` (see :class:`RoFormerLM`). The only arguments are what the data
+    dictates:
 
     * ``mask_spec`` -- ``transformer_mask`` only, the per-head encoder mask.
     * ``pe``        -- ``transformer_mask`` only, ``"none"`` or ``"sinusoidal"``.
