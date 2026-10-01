@@ -78,6 +78,29 @@ def set_dropout(module: nn.Module, p: float) -> None:
             m.dropout = p
 
 
+def tied_embedding(vocab_size: int, d_model: int, pad_token_id: int):
+    """Return ``(embed, lm_head)`` sharing one ``[vocab, d_model]`` weight.
+
+    The answers here are copied out of the prompt. With one shared matrix a token that
+    attention carries to the output already scores highest against its own row, so the
+    only thing left to learn is where to look. With a separate output matrix every
+    token's row has to be aligned with its input embedding first, and that only gets a
+    gradient once the model is already copying: on a needle-copy task the untied model
+    never left the answer-prior plateau, and tying alone was enough to leave it.
+
+    The weight is N(0, 1/d_model), so the caller multiplies the embedding by
+    ``sqrt(d_model)`` on the way in: inputs are unit scale, as before, and the output
+    logits start small instead of at the scale of an N(0, 1) matrix.
+    """
+    embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+    nn.init.normal_(embed.weight, mean=0.0, std=d_model ** -0.5)
+    with torch.no_grad():
+        embed.weight[pad_token_id].zero_()
+    lm_head = nn.Linear(d_model, vocab_size, bias=False)
+    lm_head.weight = embed.weight
+    return embed, lm_head
+
+
 class TransformerMaskLM(TokenLM):
     """:class:`TransformerMask` with token embeddings and an output projection.
 
@@ -87,8 +110,9 @@ class TransformerMaskLM(TokenLM):
     ``pe="sinusoidal"`` adds the sinusoidal encoding of "Attention Is All You Need",
     from ``torch_geometric.nn.encoding.PositionalEncoding``, to both the encoder and
     the decoder input, as the original Transformer does. It is the only difference
-    from ``pe="none"``: the embeddings are neither scaled by sqrt(d_model) nor followed
-    by an extra dropout, so the two arms differ in the encoding alone. With
+    from ``pe="none"``: no extra dropout follows it, so the two arms differ in the
+    encoding alone. The input and output embeddings are tied (:func:`tied_embedding`)
+    and the layers are pre-norm (:class:`TransformerMask`). With
     ``pe="none"`` position reaches the encoder only through ``mask_spec``, and the
     decoder only through its causal mask.
     """
@@ -106,15 +130,16 @@ class TransformerMaskLM(TokenLM):
             set_dropout(self.transformer, dropout)
         dropout_rate = self.transformer.encoder.layers[0].dropout.p
         d_model = self.transformer.d_model
-        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        self.embed, self.lm_head = tied_embedding(vocab_size, d_model, pad_token_id)
+        self.embed_scale = d_model ** 0.5
         self.pos_encoding = None
         if pe == "sinusoidal":
             # Imported only for this arm: torch_geometric is a heavy import the other
             # models do not need.
             from torch_geometric.nn.encoding import PositionalEncoding
             self.pos_encoding = PositionalEncoding(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size)
-        self.description = (f"transformer_mask (encoder-decoder, nn.Transformer defaults) "
+        self.description = (f"transformer_mask (encoder-decoder, nn.Transformer sizes, "
+                            f"pre-norm, tied embeddings) "
                             f"| enc_mask={mask_spec} | pe={pe} | dropout {dropout_rate}")
 
     def _embed(self, ids: torch.Tensor) -> torch.Tensor:
@@ -122,7 +147,7 @@ class TransformerMaskLM(TokenLM):
 
         Used for both the encoder and the decoder input, so both get the encoding.
         """
-        x = self.embed(ids)
+        x = self.embed(ids) * self.embed_scale
         if self.pos_encoding is not None:
             # Sequences are right-padded, so every real token's position counts from 0.
             positions = torch.arange(ids.size(1), device=ids.device)
@@ -219,8 +244,8 @@ class RoFormerLM(DecoderOnlyLM):
     wide, 12 layers, ff 3072: 85.7M parameters outside the vocabulary matrix, about
     twice transformer_mask's 44.2M). It keeps transformer_mask's width -- 512 wide,
     8 heads of 64, ff 2048 -- and takes 14 layers, which gives 44.4M outside the
-    vocabulary matrix. The total is ~70M against transformer_mask's ~96M only because
-    RoFormer ties its input and output embeddings and transformer_mask does not.
+    vocabulary matrix, and ~70M in total for both: each ties its input and output
+    embeddings.
     Beyond the sizes, only what the data or the decoder-only setup requires is set:
     the vocabulary, the pad id, ``is_decoder`` (for the causal mask) and ``max_len``,
     plus ``dropout`` when overridden.
@@ -274,7 +299,8 @@ class ALiBiLM(DecoderOnlyLM):
     Uses ``ALiBiConfig``'s defaults (see ``tmodel/alibi/config.py``); only ``max_len``
     is set, plus ``dropout`` when overridden. The upstream model works
     on vectors and its pre-norm layers end without a final LayerNorm, so the embedding,
-    the final norm and the output head are added here.
+    the final norm and the output head are added here. The embedding and the head are
+    tied (:func:`tied_embedding`).
     """
 
     def __init__(self, vocab_size: int, pad_token_id: int, max_len: int,
@@ -286,17 +312,17 @@ class ALiBiLM(DecoderOnlyLM):
                              **({} if dropout is None else dict(dropout=dropout)))
         if not config.causal:
             raise ValueError("ALiBiConfig must be causal: the model is trained decoder-only.")
-        self.embed = nn.Embedding(vocab_size, config.d_model, padding_idx=pad_token_id)
+        self.embed, self.lm_head = tied_embedding(vocab_size, config.d_model, pad_token_id)
+        self.embed_scale = config.d_model ** 0.5
         self.transformer = ALiBiTransformer(config)
         self.norm = nn.LayerNorm(config.d_model)
-        self.lm_head = nn.Linear(config.d_model, vocab_size)
         self.description = (f"alibi (decoder-only, ALiBi) | ALiBiConfig defaults: "
                             f"{config.d_model} wide, {config.num_heads} heads, "
                             f"{config.num_layers} layers, ff x{config.expansion_factor}, "
                             f"dropout {config.dropout} | max_len={max_len}")
 
     def hidden(self, seq: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.transformer(self.embed(seq)))
+        return self.norm(self.transformer(self.embed(seq) * self.embed_scale))
 
     def head(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)
@@ -307,9 +333,10 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
                 dropout: float | None = None) -> TokenLM:
     """Build one of :data:`MODEL_TYPES` with the shared ``model(src, tgt_in)`` interface.
 
-    ``transformer_mask`` and ``alibi`` use their library's default hyperparameters
-    (``nn.Transformer``'s and ``ALiBiConfig``'s); ``roformer`` is sized to match
-    ``transformer_mask`` (see :class:`RoFormerLM`). The only arguments are what the data
+    ``transformer_mask`` and ``alibi`` use their library's default sizes
+    (``nn.Transformer``'s and ``ALiBiConfig``'s), with tied embeddings and, for
+    ``transformer_mask``, pre-norm; ``roformer`` is sized to match ``transformer_mask``
+    (see :class:`RoFormerLM`). The only arguments are what the data
     dictates:
 
     * ``mask_spec`` -- ``transformer_mask`` only, the per-head encoder mask.

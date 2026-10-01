@@ -10,9 +10,14 @@ class TransformerMask(nn.Transformer):
 
     The only argument is ``mask_spec`` for the encoder (see :class:`MaskedEncoder`).
     Everything else follows the standard ``nn.Transformer`` configuration: d_model=512,
-    8 heads, 6 encoder and 6 decoder layers, feed-forward 2048, dropout 0.1, ReLU,
-    post-norm, and ``batch_first=False`` inputs of shape ``[seq, batch, d_model]``.
+    8 heads, 6 encoder and 6 decoder layers, feed-forward 2048, dropout 0.1, ReLU, and
+    ``batch_first=False`` inputs of shape ``[seq, batch, d_model]``.
     With 8 heads, ``mask_spec`` is either one code or eight (e.g. ``"CCCCFFFF"``).
+
+    The one departure from the defaults is ``norm_first=True`` (pre-norm) in both stacks.
+    Pre-norm leaves the residual stream un-normalised between layers, so a token copied
+    by attention reaches the output as itself; with post-norm the model escaped the
+    answer-prior plateau on a needle-copy task but stalled short of solving it.
 
     The encoder is built exactly as ``nn.Transformer`` builds its own and passed in as
     ``custom_encoder``; the decoder, the forward pass and parameter initialisation are
@@ -23,11 +28,13 @@ class TransformerMask(nn.Transformer):
     def __init__(self, mask_spec: str):
         d_model, nhead, num_encoder_layers = 512, 8, 6  # nn.Transformer's defaults
         # nn.TransformerEncoderLayer's remaining defaults (feed-forward 2048, dropout 0.1,
-        # ReLU, eps 1e-5, post-norm, bias) are the same as nn.Transformer's.
-        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead)
+        # ReLU, eps 1e-5, bias) are the same as nn.Transformer's. norm_first is the one
+        # departure, set on both stacks -- see the class docstring.
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, norm_first=True)
         encoder_norm = nn.LayerNorm(d_model)
         encoder = MaskedEncoder(encoder_layer, num_encoder_layers, mask_spec, encoder_norm)
-        super().__init__(d_model, nhead, num_encoder_layers, custom_encoder=encoder)
+        super().__init__(d_model, nhead, num_encoder_layers, custom_encoder=encoder,
+                         norm_first=True)
         self.mask_spec = mask_spec
 
 

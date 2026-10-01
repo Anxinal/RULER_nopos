@@ -7,9 +7,10 @@ Models (``--model``, built by ``tmodel/models.py``)
 * ``roformer``          decoder-only, rotary position embeddings.
 * ``alibi``             decoder-only, ALiBi.
 
-transformer_mask and alibi use their library's default hyperparameters
-(``nn.Transformer``, ``ALiBiConfig``); roformer is sized to match transformer_mask
-(512 wide, 14 layers; see ``tmodel/models.py``). There are no size flags. The decoder-only
+transformer_mask and alibi use their library's default sizes (``nn.Transformer``,
+``ALiBiConfig``); roformer is sized to match transformer_mask (512 wide, 14 layers).
+Every model ties its input and output embeddings, and transformer_mask is pre-norm
+(see ``tmodel/models.py``). There are no size flags. The decoder-only
 models' maximum length is set to ``--src_len + --tgt_len``.
 
 The decoder-only models see prompt + answer as one sequence and are scored on the
@@ -968,9 +969,9 @@ def add_model_args(p):
                         "Default --src_len + --tgt_len. Set it to the longest EVAL length "
                         "+ --tgt_len if the model will be evaluated on longer prompts. "
                         "alibi allocates a max_len x max_len mask per layer.")
-    # No size flags: transformer_mask and alibi use their library's defaults
+    # No size flags: transformer_mask and alibi use their library's default sizes
     # (nn.Transformer, ALiBiConfig); roformer is sized to match transformer_mask.
-    # See tmodel/models.py.
+    # All tie their embeddings. See tmodel/models.py.
 
 
 def build_parser():

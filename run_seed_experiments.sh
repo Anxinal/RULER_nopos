@@ -11,7 +11,8 @@
 #       pe none,       mask CCCCCCCC
 #       pe sinusoidal, mask BBBBBBBB   (vanilla transformer, no mask)
 #   roformer  (decoder-only, RoPE)
-# transformer_mask uses nn.Transformer defaults; roformer is sized to match it
+# transformer_mask uses nn.Transformer's sizes, pre-norm; roformer is sized to match it.
+# Both tie their input and output embeddings, ~70M parameters each
 # (see tmodel/models.py).
 #
 # Pipeline (per arm and seed):
@@ -82,8 +83,8 @@ PIP_ARGS="${PIP_ARGS:-}"
 TORCH_SPEC="${TORCH_SPEC:-}"
 
 # ====================== MODEL ================================================
-# No size settings: every model uses its library's default hyperparameters
-# (nn.Transformer, RoFormerConfig, ALiBiConfig). transformer_mask has 8 heads, so each
+# No size settings: the sizes are fixed in tmodel/models.py (nn.Transformer's, with
+# roformer matched to them). transformer_mask has 8 heads, so each
 # mask spec below is one code per head. MAX_LEN is set after the data section.
 TM_NUM_HEADS=8
 TOKENIZER="gpt2"
