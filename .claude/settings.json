@@ -5,7 +5,14 @@
       "Bash(SANITY_TRAIN_SAMPLES=400 SANITY_EVAL_SAMPLES=25 SANITY_EPOCHS=4 SANITY_MIN_SCORE=40 VENV_DIR=/private/tmp/claude-501/-Users-anxiao-python-nopos-ruler/633b0a63-ec02-4e58-a429-90dc7f796280/scratchpad/venv EXP_ROOT=/private/tmp/claude-501/-Users-anxiao-python-nopos-ruler/633b0a63-ec02-4e58-a429-90dc7f796280/scratchpad/expReal bash scripts/run_experiments.sh --sanity --local)",
       "Bash(python3 -c ' *)",
       "Bash(grep -nE \"CKPT=|best.pt|if \\\\[|python \\\\\"\\\\\\\\\\\\$\\\\{TRAIN_SCRIPT\\\\}\\\\\"|Phase 1\")",
-      "Bash(sed -n '/# Every eval length is done and scored/,/^    fi$/p' scripts/run_experiments.sh)"
+      "Bash(sed -n '/# Every eval length is done and scored/,/^    fi$/p' scripts/run_experiments.sh)",
+      "Bash(sed -n '/^class RoFormerLMPredictionHead/,/^class RoFormerPreTrainedModel/p' tmodel/roformer/modeling_roformer.py | head -60; sed -n '/^class RoFormerLM/,/^class ALiBiLM/p' tmodel/models.py | grep -n \"config = \\\\|def head\\\\|cls\\(\" )",
+      "Bash(git commit -q -m 'Tie embeddings in every model; pre-norm transformer_mask; ALiBi 14 layers *)",
+      "Bash(git push *)"
+    ],
+    "additionalDirectories": [
+      "/Users/anxiao/python/nopos_ruler/tmodel/roformer",
+      "/Users/anxiao/python/nopos_ruler/tmodel"
     ]
   }
 }

@@ -96,6 +96,9 @@ parser.add_argument("--stop_words", type=str, default='')
 parser.add_argument("--sliding_window_size", type=int)
 parser.add_argument("--threads", type=int, default=4)
 parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--num_samples", type=int, default=None,
+                    help="Predict only the first N samples of the data file. Default: all. "
+                         "Samples already in the prediction file are skipped either way.")
 parser.add_argument("--max_new_tokens", type=int, default=None,
                     help="Override the generation budget. The per-task "
                          "tokens_to_generate in data/synthetic/constants.py is ALSO used "
@@ -258,11 +261,12 @@ def main():
     pred_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Load data
+    data = read_manifest(task_file)
+    if args.num_samples is not None:
+        data = data[:args.num_samples]
     if os.path.exists(pred_file):
-        pred_index = [sample['index'] for sample in read_manifest(pred_file)]
-        data = [sample for sample in read_manifest(task_file) if sample['index'] not in pred_index]
-    else:
-        data = read_manifest(task_file)
+        pred_index = {sample['index'] for sample in read_manifest(pred_file)}
+        data = [sample for sample in data if sample['index'] not in pred_index]
 
     # Load api
     # A generous generation budget lets a model that cannot determine the answer hedge:
@@ -375,6 +379,11 @@ def main():
                 start_idx = end_idx + 1
 
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
+    # Peak host memory of this process. ru_maxrss is kilobytes on Linux, bytes on macOS.
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_gb = peak / (2 ** 30 if sys.platform == "darwin" else 2 ** 20)
+    print(f"Peak host memory: {peak_gb:.1f} GB over {len(data)} samples")
 
 
 if __name__ == '__main__':

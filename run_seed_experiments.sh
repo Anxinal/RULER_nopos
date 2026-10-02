@@ -30,6 +30,8 @@
 #   bash run_seed_experiments.sh --local      # run sequentially, no SLURM
 #   bash run_seed_experiments.sh --summary    # collect results into CSV
 #
+# To evaluate existing checkpoints without training, use run_seed_eval.sh.
+#
 # wandb: jobs need credentials on the compute nodes -- `wandb login` on a shared home
 # (writes ~/.netrc) or WANDB_API_KEY exported when submitting (sbatch passes the
 # environment through). Set WANDB_MODE=offline to log locally and `wandb sync` later.
@@ -116,6 +118,10 @@ TRAIN_SEED=934
 # 2048 is the training length, then 2x and 4x it.
 EVAL_SEQ_LENGTHS=(2048 4096 8192)
 EVAL_SAMPLES=1000
+# How many of those are actually predicted and scored: the first PRED_SAMPLES of each
+# eval file. The files on disk keep all EVAL_SAMPLES, so changing this regenerates
+# nothing, and a larger value later only adds the samples not yet predicted.
+PRED_SAMPLES="${PRED_SAMPLES:-500}"
 # QA questions reserved for evaluation. DORMANT while no qa_* task is selected: the
 # --qa_start/--qa_end flags below are still passed to prepare.py, which forwards them
 # only for tasks whose generator is qa.py, so they are a no-op for the current suite.
@@ -904,6 +910,7 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
             CAP="$(answer_token_cap "${EVAL_DATA}/${TASK}/validation.jsonl")"
             python "${SCRIPT_DIR}/pred/call_api.py" \
                 --max_new_tokens "${CAP}" \
+                --num_samples "${PRED_SAMPLES}" \
                 --data_dir  "${EVAL_DATA}" \
                 --save_dir  "${PRED_DIR}" \
                 --benchmark synthetic \
@@ -1043,7 +1050,7 @@ set -euo pipefail
 # install would not be visible here and hardcoding false would strand every job with
 # no way to recover.
 $(declare -p AUTO_INSTALL VENV_DIR REQUIREMENTS BOOTSTRAP_PYTHON PIP_ARGS TORCH_SPEC)
-$(declare -p KEEP_CHECKPOINTS RETRAIN)
+$(declare -p KEEP_CHECKPOINTS RETRAIN PRED_SAMPLES)
 $(declare -p EXP_ROOT TRAIN_DATA_DIR EVAL_DATA_ROOT TRAIN_SCRIPT MAX_LEN TOKENIZER \
              SRC_LEN TGT_LEN EPOCHS BATCH_SIZE GRAD_ACCUM LR WARMUP PRECISION \
              EVAL_SEQ_LENGTHS EVAL_SAMPLES EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA \
