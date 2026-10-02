@@ -35,7 +35,7 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-08:00:00}"
+TIME="${TIME:-05:00:00}"
 
 # ====================== PATHS ================================================
 # Same defaults as run_seed_experiments.sh, so the two find the same files.
