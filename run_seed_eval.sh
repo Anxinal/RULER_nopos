@@ -57,9 +57,8 @@ read -r -a EVAL_TASKS <<< "${EVAL_TASKS:-vt_2chain vt_4chain niah_multikey_1 nia
 PRED_SAMPLES="${PRED_SAMPLES:-500}"
 PRED_CHUNK="${PRED_CHUNK:-100}"
 
-# The sweep deletes best.pt once a run is scored. Here it is kept by default, since a
-# second pass (more samples, another length) needs it; set false to delete as the
-# sweep does.
+# Checkpoints are kept, as in the sweep, since a second pass (more samples, another
+# length) needs them. Set false to delete a run's checkpoints once it is scored.
 KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-true}"
 
 # ====================== FLAGS ================================================

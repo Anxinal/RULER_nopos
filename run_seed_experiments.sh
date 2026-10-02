@@ -53,14 +53,17 @@ GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
 TIME="${TIME:-16:00:00}"
-# Checkpoints are deleted once a cell has been evaluated at every length, since
-# the predictions and summaries are what the analysis reads. At ~0.9 GB per cell
-# this is the difference between ~8 GB and ~0 GB of standing disk. Set true to keep
-# them, e.g. to re-run evaluation later without retraining.
-KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-false}"
+# Checkpoints are kept after a cell has been evaluated, so later experiments can
+# evaluate them again (run_seed_eval.sh) or start from them: best.pt (~0.3 GB) and, with
+# the starter curriculum, starter.pt (~0.8 GB, it carries the AdamW state). Set false to
+# delete both once a cell is scored at every length.
+#
+# The consequence: a kept best.pt means resubmitting this script does NOT retrain that
+# cell -- see RETRAIN just below. After changing the model or the training settings,
+# submit with RETRAIN=true or point EXP_ROOT at a new directory.
+KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-true}"
 # Reuse an existing checkpoint instead of retraining, so a cell whose evaluation was cut
-# short (a TIME kill lands before the checkpoint s deleted) can be resubmitted and go
-# straight to prediction. call_api.py resumes by sample index, so prediction continues
+# short can be resubmitted and go straight to prediction. call_api.py resumes by sample index, so prediction continues
 # where it stopped rather than starting over. RETRAIN=true forces training regardless.
 RETRAIN="${RETRAIN:-false}"
 # Python environment. The virtualenv is created on first use and populated from
@@ -929,10 +932,9 @@ print(f\"    checkpoint is from epoch {c.get('epoch','?')}, val_loss {c.get('val
             --benchmark synthetic
     done
 
-    # Every eval length is done and scored, so the weights have served their purpose:
-    # predictions and summaries are on disk and are what the analysis reads. Deleting
-    # here is safe because 'set -e' aborts before this line if any eval failed, so a
-    # checkpoint is only removed once its results exist.
+    # Kept by default. With KEEP_CHECKPOINTS=false, deleting here is safe because
+    # 'set -e' aborts before this line if any eval failed, so a checkpoint is only
+    # removed once its results exist.
     if ! $KEEP_CHECKPOINTS; then
         # starter.pt too: it carries the AdamW state, so it is ~3x the size of best.pt.
         rm -f "${CKPT}" "${EXP_DIR}/last.pt" "${EXP_DIR}/starter.pt"
