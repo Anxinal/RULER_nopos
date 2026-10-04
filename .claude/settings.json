@@ -8,7 +8,9 @@
       "Bash(sed -n '/# Every eval length is done and scored/,/^    fi$/p' scripts/run_experiments.sh)",
       "Bash(sed -n '/^class RoFormerLMPredictionHead/,/^class RoFormerPreTrainedModel/p' tmodel/roformer/modeling_roformer.py | head -60; sed -n '/^class RoFormerLM/,/^class ALiBiLM/p' tmodel/models.py | grep -n \"config = \\\\|def head\\\\|cls\\(\" )",
       "Bash(git commit -q -m 'Tie embeddings in every model; pre-norm transformer_mask; ALiBi 14 layers *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(sed -i '' 's/^class PositionalProbe\\(nn.modules\\):/class PositionalProbe\\(nn.Module\\):/' tmodel/probe.py)",
+      "Bash(python3 -c \"import tmodel.probe; print\\('probe imports'\\)\")"
     ],
     "additionalDirectories": [
       "/Users/anxiao/python/nopos_ruler/tmodel/roformer",

@@ -46,7 +46,7 @@ LOG_DIR="${EXP_ROOT}/slurm_logs"
 TOKENIZER="${TOKENIZER:-gpt2}"
 
 # ====================== WHAT TO EVALUATE =====================================
-read -r -a SEEDS <<< "${SEEDS:-96 97}"
+read -r -a SEEDS <<< "${SEEDS:-96}"
 # Keep in step with run_seed_experiments.sh: these must already be generated.
 read -r -a EVAL_SEQ_LENGTHS <<< "${EVAL_SEQ_LENGTHS:-2048 4096 8192}"
 read -r -a EVAL_TASKS <<< "${EVAL_TASKS:-vt_2chain vt_4chain niah_multikey_1 niah_multikey_2 niah_multikey_3}"

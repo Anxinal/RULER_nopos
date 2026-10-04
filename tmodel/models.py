@@ -1,19 +1,3 @@
-"""Token-level wrappers that give every tmodel model the same interface.
-
-Training treats a model as ``logits = model(src, tgt_in)``: ``src`` is the
-right-padded prompt ``[batch, src_len]``, ``tgt_in`` is the right-padded answer
-``[batch, tgt_len]`` starting with BOS, and ``logits`` is ``[batch, tgt_len, vocab]``,
-aligned so that position ``t`` predicts ``tgt_out[:, t]``. Prediction uses
-``model.generate(src, ...)`` (greedy). Every wrapper also carries ``pad_token_id`` and a
-one-line ``description`` for the log.
-
-Each model is trained in its native form:
-
-* ``transformer_mask`` is an encoder-decoder, so the prompt goes to the encoder and the
-  answer to the decoder.
-* ``roformer`` and ``alibi`` are decoder-only, so each sample becomes one sequence,
-  prompt followed by answer, and only the answer positions are scored.
-"""
 
 import torch
 import torch.nn as nn
