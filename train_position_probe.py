@@ -8,6 +8,7 @@ where the answer starts. Writes <run>/position_probe_layer<L>.pt.
 """
 
 import argparse
+import copy
 import glob
 import json
 import os
@@ -57,14 +58,22 @@ def collect(model, tokenizer, ckpt, data_dir, layer, stack, num_samples, device)
     return torch.stack(xs), torch.tensor(ys)
 
 
+@torch.no_grad()
+def evaluate(probe, x, y):
+    error = (probe(x).argmax(-1) - y).abs().float()
+    return dict(accuracy=(error == 0).float().mean().item(),
+                within_8=(error <= 8).float().mean().item(),
+                mean_abs_error=error.mean().item())
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("folder", help="run folder holding best.pt and its tokenizer")
     p.add_argument("layer", type=int)
     p.add_argument("--data_dir", required=True, help="RULER training data root")
     p.add_argument("--stack", default="decoder", choices=["encoder", "decoder"])
-    p.add_argument("--num_samples", type=int, default=2000)
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--num_samples", type=int, default=20000)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
@@ -76,9 +85,11 @@ def main():
     x, y = collect(model, tokenizer, ckpt, args.data_dir, args.layer, args.stack,
                    args.num_samples, device)
 
-    # 90/10 split, then standardise: the pre-norm residual stream grows with depth.
+    # 80/10/10 split: validation picks the epoch, test is only reported.
     order = torch.randperm(len(x))
-    test, train = order[:len(x) // 10], order[len(x) // 10:]
+    n = len(x) // 10
+    test, val, train = order[:n], order[n:2 * n], order[2 * n:]
+    # Standardise: the pre-norm residual stream grows with depth.
     mean, std = x[train].mean(0), x[train].std(0) + 1e-6
     x = ((x - mean) / std).to(device)
     y = y.to(device)
@@ -87,6 +98,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(probe.parameters(), lr=args.lr)
 
+    best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         probe.train()
         for batch in train[torch.randperm(len(train))].split(args.batch_size):
@@ -96,20 +108,23 @@ def main():
             optimizer.step()
 
         probe.eval()
-        with torch.no_grad():
-            error = (probe(x[test]).argmax(-1) - y[test]).abs().float()
-        metrics = dict(accuracy=(error == 0).float().mean().item(),
-                       within_8=(error <= 8).float().mean().item(),
-                       mean_abs_error=error.mean().item())
-        print(f"epoch {epoch:3d} | train loss {loss.item():.3f} | test acc {metrics['accuracy']:.3f} "
-              f"| within 8: {metrics['within_8']:.3f} | mean abs error {metrics['mean_abs_error']:.1f}")
+        val_error = evaluate(probe, x[val], y[val])["mean_abs_error"]
+        # Mean abs error picks the epoch: exact accuracy is too noisy at a few percent.
+        if val_error < best_val:
+            best_val, best_epoch = val_error, epoch
+            best_state = copy.deepcopy(probe.state_dict())
+            metrics = evaluate(probe, x[test], y[test])
+        print(f"epoch {epoch:3d} | train loss {loss.item():.3f} | val mean abs error {val_error:.1f} "
+              f"| best epoch {best_epoch}")
 
+    print(f"test at epoch {best_epoch}: acc {metrics['accuracy']:.3f} | within 8: "
+          f"{metrics['within_8']:.3f} | mean abs error {metrics['mean_abs_error']:.1f}")
     # Write to a temp file and rename, so a killed run never leaves a partial probe.
     out = os.path.join(args.folder, f"position_probe_layer{args.layer}.pt")
-    torch.save(dict(probe=probe.state_dict(), mean=mean, std=std, metrics=metrics,
-                    args=vars(args)), out + ".tmp")
+    torch.save(dict(probe=best_state, mean=mean, std=std, metrics=metrics,
+                    best_epoch=best_epoch, args=vars(args)), out + ".tmp")
     os.replace(out + ".tmp", out)
-    print(f"saved {out} ({len(train)} train / {len(test)} test samples)")
+    print(f"saved {out} ({len(train)} train / {len(val)} val / {len(test)} test samples)")
 
 
 if __name__ == "__main__":

@@ -1,27 +1,24 @@
 import torch.nn as nn
-import numpy as np 
+
 
 class PositionalProbe(nn.Module):
+    """MLP from a hidden state to one logit per position (or position bin).
 
-    def __init__(self, input_dim, hidden_dim = 1024, output_dim = 2048):
+    Small on purpose: with ~1 training example per class, two 1024-wide layers memorised
+    the training set (loss 0.001) while test accuracy stayed at 4%. One narrow hidden
+    layer with dropout leaves less room for that. ``num_hidden_layers=0`` is a linear
+    probe. Returns raw logits: the loss applies the softmax.
+    """
+
+    def __init__(self, input_dim, hidden_dim=256, output_dim=2048, num_hidden_layers=1,
+                 dropout=0.3):
         super().__init__()
+        layers, dim = [], input_dim
+        for _ in range(num_hidden_layers):
+            layers += [nn.Linear(dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
+            dim = hidden_dim
+        layers.append(nn.Linear(dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
-        self.layer1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.layer2 = nn.Linear(hidden_dim, hidden_dim)
-        self.layer3 = nn.Linear(hidden_dim, output_dim)
-        
     def forward(self, x):
-
-        x = self.layer1(x)
-        x = self.activation(x)
-        x = self.layer2(x)
-        x = self.activation(x)
-        x = self.layer3(x)
-        return x
-
-  
-
-
-    
-    
+        return self.net(x)

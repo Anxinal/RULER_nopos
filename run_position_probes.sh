@@ -19,7 +19,7 @@ PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-64G}"
-TIME="${TIME:-02:00:00}"
+TIME="${TIME:-06:00:00}"
 
 MODE="${1:-slurm}"
 
