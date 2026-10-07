@@ -53,7 +53,9 @@ def collect(model, tokenizer, ckpt, data_dir, layer, stack, num_samples, device)
                 if char < 0 or token < 0:
                     continue                                    # answer absent or cut off
                 src = torch.tensor([ids], device=device)
-                xs.append(extract_hidden_state(model, src, bos, layer, stack)[0, -1])
+                # clone: indexing returns a view that would keep the whole
+                # [seq, d_model] state of every sample alive (~4 MB each for the encoder).
+                xs.append(extract_hidden_state(model, src, bos, layer, stack)[0, -1].clone())
                 ys.append(token)
     return torch.stack(xs), torch.tensor(ys)
 

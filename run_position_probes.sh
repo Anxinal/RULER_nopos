@@ -5,6 +5,7 @@
 #   bash run_position_probes.sh              # one Slurm job per run
 #   bash run_position_probes.sh --local      # run here, one after another
 #   bash run_position_probes.sh --dry-run    # list what would run
+#   FORCE=1 bash run_position_probes.sh      # retrain probes that already exist
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +15,7 @@ DATA_DIR="${DATA_DIR:-${EXP_ROOT}/train_data/2048/data}"
 LOG_DIR="${EXP_ROOT}/slurm_logs"
 LAYERS="${LAYERS:-1 2 3 4}"
 STACK="${STACK:-encoder}"
+FORCE="${FORCE:-0}"         # 1: retrain a layer even if its probe file exists
 
 PARTITION="${PARTITION:-gpu}"
 GPU_SPEC="${GPU_SPEC:-h100-96:1}"
@@ -23,13 +25,13 @@ TIME="${TIME:-06:00:00}"
 
 MODE="${1:-slurm}"
 
-# Probes every layer of one run; a layer whose probe file exists is skipped.
+# Probes every layer of one run; a layer whose probe file exists is skipped unless FORCE=1.
 probe_run() {
     local run="$1" layer
     export PATH="${VENV_DIR}/bin:${PATH}"
     cd "${REPO_DIR}"
     for layer in ${LAYERS}; do
-        if [ -f "${run}/position_probe_layer${layer}.pt" ]; then
+        if [ "${FORCE}" != 1 ] && [ -f "${run}/position_probe_layer${layer}.pt" ]; then
             echo "--- $(basename "${run}") layer ${layer}: already done ---"
             continue
         fi
@@ -44,7 +46,7 @@ for ckpt in "${EXP_ROOT}"/transformer_mask_pe*_s*/best.pt; do
     run="$(dirname "${ckpt}")"
     name="$(basename "${run}")"
     case "${MODE}" in
-        --dry-run) echo "[dry-run] ${name}: layers ${LAYERS}" ;;
+        --dry-run) echo "[dry-run] ${name}: layers ${LAYERS} (FORCE=${FORCE})" ;;
         --local)   probe_run "${run}" ;;
         slurm)
             sbatch --job-name="probe_${name}" --partition="${PARTITION}" --gpus="${GPU_SPEC}" \
@@ -53,7 +55,7 @@ for ckpt in "${EXP_ROOT}"/transformer_mask_pe*_s*/best.pt; do
                    --error="${LOG_DIR}/probe_${name}_%j.err" <<EOF
 #!/bin/bash
 set -euo pipefail
-$(declare -p REPO_DIR VENV_DIR DATA_DIR LAYERS STACK)
+$(declare -p REPO_DIR VENV_DIR DATA_DIR LAYERS STACK FORCE)
 $(declare -f probe_run)
 probe_run "${run}"
 EOF
