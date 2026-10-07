@@ -5,6 +5,11 @@
 One example per RULER niah sample. Input: the layer's hidden state at the last position,
 where the model is about to write the answer. Target: the token position in the prompt
 where the answer starts. Writes <run>/position_probe_layer<L>.pt.
+
+With ``--mode online`` (or ``offline``) the probe is tracked in Weights & Biases, one
+run per (model run, stack, layer): every epoch logs ``train/*`` and ``val/*`` (loss,
+accuracy, within_8, mean_abs_error) against the epoch, and the summary holds ``test/*``
+at the best epoch. The default ``--mode disabled`` logs nothing and needs no login.
 """
 
 import argparse
@@ -14,6 +19,7 @@ import json
 import os
 
 import torch
+import wandb
 from transformers import AutoTokenizer
 import torch.nn as nn
 from tmodel.CrossEntropyLossWithPositionBias import CrossEntropyLossWithPositionBias
@@ -62,8 +68,10 @@ def collect(model, tokenizer, ckpt, data_dir, layer, stack, num_samples, device)
 
 @torch.no_grad()
 def evaluate(probe, x, y):
-    error = (probe(x).argmax(-1) - y).abs().float()
-    return dict(accuracy=(error == 0).float().mean().item(),
+    logits = probe(x)
+    error = (logits.argmax(-1) - y).abs().float()
+    return dict(loss=nn.functional.cross_entropy(logits, y).item(),
+                accuracy=(error == 0).float().mean().item(),
                 within_8=(error <= 8).float().mean().item(),
                 mean_abs_error=error.mean().item())
 
@@ -79,11 +87,31 @@ def main():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
+    g = p.add_argument_group("wandb")
+    g.add_argument("--project", default="Ruler_nopos")
+    g.add_argument("--entity", default=None, help="wandb team or user; default is yours.")
+    g.add_argument("--group", default="position_probe")
+    g.add_argument("--run_name", default=None,
+                   help="Default: probe-<run folder>-<stack>-L<layer>.")
+    g.add_argument("--mode", default="disabled", choices=["online", "offline", "disabled"],
+                   help="offline writes the run locally for a later `wandb sync`.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer, ckpt = load_model(args.folder, device)
+    source = os.path.basename(os.path.normpath(args.folder))
+    # mode="disabled" gives a no-op run, so nothing below depends on the mode. Leaving
+    # the block finishes the run; if the probe raises, wandb marks it failed.
+    with wandb.init(project=args.project, entity=args.entity, group=args.group,
+                    name=args.run_name or f"probe-{source}-{args.stack}-L{args.layer}",
+                    mode=args.mode, job_type="position_probe",
+                    config=dict(vars(args), source_run=source, source_args=ckpt["args"],
+                                description=model.description)) as run:
+        train_probe(args, model, tokenizer, ckpt, device, run)
+
+
+def train_probe(args, model, tokenizer, ckpt, device, run):
     x, y = collect(model, tokenizer, ckpt, args.data_dir, args.layer, args.stack,
                    args.num_samples, device)
 
@@ -97,6 +125,7 @@ def main():
     y = y.to(device)
 
     probe = PositionalProbe(x.size(1), output_dim=ckpt["args"]["src_len"]).to(device)
+    run.summary.update(dict(n_train=len(train), n_val=len(val), n_test=len(test)))
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(probe.parameters(), lr=args.lr)
 
@@ -110,7 +139,8 @@ def main():
             optimizer.step()
 
         probe.eval()
-        val_error = evaluate(probe, x[val], y[val])["mean_abs_error"]
+        train_metrics, val_metrics = evaluate(probe, x[train], y[train]), evaluate(probe, x[val], y[val])
+        val_error = val_metrics["mean_abs_error"]
         # Mean abs error picks the epoch: exact accuracy is too noisy at a few percent.
         if val_error < best_val:
             best_val, best_epoch = val_error, epoch
@@ -118,6 +148,11 @@ def main():
             metrics = evaluate(probe, x[test], y[test])
         print(f"epoch {epoch:3d} | train loss {loss.item():.3f} | val mean abs error {val_error:.1f} "
               f"| best epoch {best_epoch}")
+        run.log({**{f"train/{k}": v for k, v in train_metrics.items()},
+                 **{f"val/{k}": v for k, v in val_metrics.items()},
+                 "epoch": epoch}, step=epoch)
+        run.summary.update({**{f"test/{k}": v for k, v in metrics.items()},
+                            "best_epoch": best_epoch, "best_val_mean_abs_error": best_val})
 
     print(f"test at epoch {best_epoch}: acc {metrics['accuracy']:.3f} | within 8: "
           f"{metrics['within_8']:.3f} | mean abs error {metrics['mean_abs_error']:.1f}")
