@@ -10,7 +10,10 @@
       "Bash(git commit -q -m 'Tie embeddings in every model; pre-norm transformer_mask; ALiBi 14 layers *)",
       "Bash(git push *)",
       "Bash(sed -i '' 's/^class PositionalProbe\\(nn.modules\\):/class PositionalProbe\\(nn.Module\\):/' tmodel/probe.py)",
-      "Bash(python3 -c \"import tmodel.probe; print\\('probe imports'\\)\")"
+      "Bash(python3 -c \"import tmodel.probe; print\\('probe imports'\\)\")",
+      "Bash(python3 -m py_compile train_position_probe.py tmodel/probe.py)",
+      "Bash(bash -n run_position_probes.sh)",
+      "Bash(git commit -q -m 'Position probe: smaller probe, validation split, report the best epoch *)"
     ],
     "additionalDirectories": [
       "/Users/anxiao/python/nopos_ruler/tmodel/roformer",

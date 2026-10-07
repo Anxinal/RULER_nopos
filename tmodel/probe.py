@@ -11,7 +11,7 @@ class PositionalProbe(nn.Module):
     """
 
     def __init__(self, input_dim, hidden_dim=256, output_dim=2048, num_hidden_layers=1,
-                 dropout=0.3):
+                 dropout=0.1):
         super().__init__()
         layers, dim = [], input_dim
         for _ in range(num_hidden_layers):

@@ -5,16 +5,16 @@ Models (``--model``, built by ``tmodel/models.py``)
 * ``transformer_mask``  encoder-decoder ``nn.Transformer`` with a per-head C/F encoder
   mask (``--encoder_mask``) and no positional encoding.
 * ``roformer``          decoder-only, rotary position embeddings.
-* ``alibi``             decoder-only, ALiBi.
+* ``alibi``             encoder-decoder (``nn.Transformer``, 4 + 4 layers), ALiBi.
 
 transformer_mask and alibi use their library's default sizes (``nn.Transformer``,
 ``ALiBiConfig``); roformer is sized to match transformer_mask (512 wide, 14 layers).
-Every model ties its input and output embeddings, and transformer_mask is pre-norm
-(see ``tmodel/models.py``). There are no size flags. The decoder-only
-models' maximum length is set to ``--src_len + --tgt_len``.
+Every model ties its input and output embeddings, and transformer_mask and alibi are
+pre-norm (see ``tmodel/models.py``). There are no size flags. The decoder-only
+model's maximum length is set to ``--src_len + --tgt_len``.
 
-The decoder-only models see prompt + answer as one sequence and are scored on the
-answer tokens only, the same tokens the encoder-decoder's decoder is scored on.
+The decoder-only model sees prompt + answer as one sequence and is scored on the
+answer tokens only, the same tokens an encoder-decoder's decoder is scored on.
 
 Data formats
 ------------
@@ -950,8 +950,9 @@ def add_model_args(p):
     g = p.add_argument_group("model")
     g.add_argument("--model", choices=MODEL_TYPES, default="transformer_mask",
                    help="transformer_mask: encoder-decoder with per-head C/F encoder "
-                        "masks and no positional encoding. roformer / alibi: "
-                        "decoder-only with RoPE / ALiBi. See tmodel/models.py.")
+                        "masks and no positional encoding. alibi: encoder-decoder "
+                        "with the ALiBi attention bias. roformer: decoder-only "
+                        "with RoPE. See tmodel/models.py.")
     g.add_argument("--encoder_mask", default="B",
                    help="transformer_mask only. Per-head encoder mask spec: one code "
                         "per attention head, e.g. CCCCFFFF for four causal and four "
@@ -965,10 +966,9 @@ def add_model_args(p):
                    help="Override every dropout rate in the model (attention included). "
                         "Default: each library's own (0.1 for all three).")
     g.add_argument("--max_len", type=int, default=None,
-                   help="roformer / alibi only: longest prompt + answer the model accepts. "
+                   help="roformer only: longest prompt + answer the model accepts. "
                         "Default --src_len + --tgt_len. Set it to the longest EVAL length "
-                        "+ --tgt_len if the model will be evaluated on longer prompts. "
-                        "alibi allocates a max_len x max_len mask per layer.")
+                        "+ --tgt_len if the model will be evaluated on longer prompts.")
     # No size flags: transformer_mask and alibi use their library's default sizes
     # (nn.Transformer, ALiBiConfig); roformer is sized to match transformer_mask.
     # All tie their embeddings. See tmodel/models.py.

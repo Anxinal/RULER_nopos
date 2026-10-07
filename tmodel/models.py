@@ -175,9 +175,8 @@ def pack_prompt_and_answer(src: torch.Tensor, tgt_in: torch.Tensor, pad_token_id
     run of padding between a short prompt and its answer. Instead each answer starts
     straight after its own prompt, and all padding ends up at the right.
 
-    Right padding is what makes this safe without a padding mask (the ALiBi model has
-    none): under a causal mask a real token only attends to earlier positions, and
-    those are all real.
+    Right padding is what makes this safe without a padding mask: under a causal mask
+    a real token only attends to earlier positions, and those are all real.
 
     Returns:
         ``(seq, answer_pos)``: ``seq`` is ``[batch, src_len + tgt_len]`` and
@@ -277,39 +276,33 @@ class RoFormerLM(DecoderOnlyLM):
         return self.model.cls(hidden)
 
 
-class ALiBiLM(DecoderOnlyLM):
-    """:class:`ALiBiTransformer` with token embeddings, a final norm and an output head.
+class ALiBiLM(TransformerMaskLM):
+    """:class:`ALiBiTransformer` with token embeddings and an output projection.
 
-    Uses ``ALiBiConfig``'s defaults (see ``tmodel/alibi/config.py``); only ``max_len``
-    is set, plus ``dropout`` when overridden. The upstream model works
-    on vectors and its pre-norm layers end without a final LayerNorm, so the embedding,
-    the final norm and the output head are added here. The embedding and the head are
-    tied (:func:`tied_embedding`).
+    An encoder-decoder like :class:`TransformerMaskLM`, whose forward pass and decoding
+    it inherits; only the transformer differs. Uses ``ALiBiConfig``'s defaults (see
+    ``tmodel/alibi/config.py``), plus ``dropout`` when overridden. Position comes from
+    the ALiBi attention bias alone: there is no positional encoding on the embeddings.
+    The input and output embeddings are tied (:func:`tied_embedding`).
     """
 
-    def __init__(self, vocab_size: int, pad_token_id: int, max_len: int,
-                 dropout: float | None = None):
-        super().__init__()
+    def __init__(self, vocab_size: int, pad_token_id: int, dropout: float | None = None):
+        nn.Module.__init__(self)
         self.pad_token_id = pad_token_id
         # None keeps ALiBiConfig's dropout.
-        config = ALiBiConfig(max_len=max_len,
-                             **({} if dropout is None else dict(dropout=dropout)))
-        if not config.causal:
-            raise ValueError("ALiBiConfig must be causal: the model is trained decoder-only.")
+        config = ALiBiConfig(**({} if dropout is None else dict(dropout=dropout)))
+        self.transformer = ALiBiTransformer(config)
+        # The config only reaches the nn.Dropout modules; attention dropout is a float
+        # on each nn.MultiheadAttention (see set_dropout).
+        set_dropout(self.transformer, config.dropout)
         self.embed, self.lm_head = tied_embedding(vocab_size, config.d_model, pad_token_id)
         self.embed_scale = config.d_model ** 0.5
-        self.transformer = ALiBiTransformer(config)
-        self.norm = nn.LayerNorm(config.d_model)
-        self.description = (f"alibi (decoder-only, ALiBi) | ALiBiConfig defaults: "
-                            f"{config.d_model} wide, {config.num_heads} heads, "
-                            f"{config.num_layers} layers, ff x{config.expansion_factor}, "
-                            f"dropout {config.dropout} | max_len={max_len}")
-
-    def hidden(self, seq: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.transformer(self.embed(seq) * self.embed_scale))
-
-    def head(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden)
+        self.pos_encoding = None
+        self.description = (f"alibi (encoder-decoder, nn.Transformer, pre-norm, tied "
+                            f"embeddings, symmetric ALiBi) | {config.d_model} wide, "
+                            f"{config.num_heads} heads, {config.num_layers} encoder + "
+                            f"{config.num_layers} decoder layers, "
+                            f"dropout {config.dropout}")
 
 
 def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
@@ -318,17 +311,15 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
     """Build one of :data:`MODEL_TYPES` with the shared ``model(src, tgt_in)`` interface.
 
     ``transformer_mask`` and ``alibi`` use their library's default sizes
-    (``nn.Transformer``'s and ``ALiBiConfig``'s), with tied embeddings and, for
-    ``transformer_mask``, pre-norm; ``roformer`` is sized to match ``transformer_mask``
-    (see :class:`RoFormerLM`). The only arguments are what the data
-    dictates:
+    (``nn.Transformer``'s and ``ALiBiConfig``'s), with tied embeddings and pre-norm;
+    ``roformer`` is sized to match ``transformer_mask`` (see :class:`RoFormerLM`). The
+    only arguments are what the data dictates:
 
     * ``mask_spec`` -- ``transformer_mask`` only, the per-head encoder mask.
     * ``pe``        -- ``transformer_mask`` only, ``"none"`` or ``"sinusoidal"``.
-    * ``max_len``   -- ``roformer`` / ``alibi`` only, the longest prompt + answer.
-      Their defaults are shorter than a RULER sample (2048-token prompts), so it has
-      to be set; ``train.py`` passes ``src_len + tgt_len``. The ALiBi model allocates a
-      ``[max_len, max_len]`` causal mask in every layer.
+    * ``max_len``   -- ``roformer`` only, the longest prompt + answer. Its default is
+      shorter than a RULER sample (2048-token prompts), so it has to be set;
+      ``train.py`` passes ``src_len + tgt_len``.
     * ``dropout``   -- every model: overrides its library's dropout rate (all of them,
       attention included). ``None`` keeps the library default.
     """
@@ -340,5 +331,5 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
     if model_type == "roformer":
         return RoFormerLM(vocab_size, pad_token_id, max_len, dropout)
     if model_type == "alibi":
-        return ALiBiLM(vocab_size, pad_token_id, max_len, dropout)
+        return ALiBiLM(vocab_size, pad_token_id, dropout)
     raise ValueError(f"unknown model {model_type!r}; expected one of {MODEL_TYPES}")

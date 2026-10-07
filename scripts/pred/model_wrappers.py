@@ -209,9 +209,9 @@ class MaskedTransformerModel:
             )
 
         # The decoder-only models see BOS + answer after the prompt, all within max_len,
-        # so the prompt must leave room for them. The encoder-decoder's encoder has no
+        # so the prompt must leave room for them. An encoder-decoder's encoder has no
         # length limit, so its prompt is never truncated.
-        if model_args["model"] == "transformer_mask":
+        if model_args["model"] in ("transformer_mask", "alibi"):
             self.max_prompt_len = None
         else:
             self.max_prompt_len = self.max_len - self.max_new_tokens - 1

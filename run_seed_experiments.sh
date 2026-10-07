@@ -165,10 +165,9 @@ TGT_LEN=128                # max decoder tokens during training
 # Seeds for the sweep; each arm is trained and evaluated once per seed.
 # Override with e.g. SEEDS="1 2 3".
 read -r -a SEEDS <<< "${SEEDS:-96 97}"
-# Longest prompt + answer the decoder-only models must accept: prompts go up to the
+# Longest prompt + answer the decoder-only model must accept: prompts go up to the
 # longest EVAL length, so the default (SRC_LEN + TGT_LEN) would truncate them at 4096 and
-# 8192. Note the ALiBi model keeps a MAX_LEN x MAX_LEN causal mask per layer (~1.7 GB over
-# its 6 layers at 8320, in memory and in best.pt). transformer_mask has no length limit.
+# 8192. The encoder-decoders (transformer_mask, alibi) have no length limit.
 MAX_LEN=$(( $(printf '%s\n' "${EVAL_SEQ_LENGTHS[@]}" | sort -n | tail -1) + TGT_LEN ))
 
 # ====================== WANDB ================================================

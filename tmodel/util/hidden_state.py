@@ -5,9 +5,8 @@ attention has been added, BEFORE the LayerNorm and the feed-forward block that f
 Every model here has exactly one LayerNorm sitting at that point, so the state is read
 as that LayerNorm's input:
 
-    transformer_mask, encoder layer    input of ``norm2``
-    transformer_mask, decoder layer    input of ``norm3`` (after self- and cross-attention)
-    alibi layer                        input of ``ffn_norm``
+    transformer_mask / alibi, encoder layer    input of ``norm2``
+    transformer_mask / alibi, decoder layer    input of ``norm3`` (after self- and cross-attention)
     roformer layer                     input of ``attention.output.LayerNorm``
 """
 
@@ -19,7 +18,7 @@ from ..models import DecoderOnlyLM
 def _layers_and_norm(model, stack):
     """The layer list of *stack*, and the name of the LayerNorm the state is read at."""
     if hasattr(model, "transformer") and hasattr(model.transformer, "decoder"):
-        # transformer_mask (nn.Transformer). Reading the norm's INPUT is only "before
+        # transformer_mask, alibi (nn.Transformer). Reading the norm's INPUT is only "before
         # LayerNorm and FFN" when the layers are pre-norm, which they are.
         tr = model.transformer
         if stack == "encoder":
@@ -27,8 +26,6 @@ def _layers_and_norm(model, stack):
         return tr.decoder.layers, "norm3"
     if stack != "decoder":
         raise ValueError("this model is decoder-only; use stack='decoder'")
-    if hasattr(model, "transformer"):                      # alibi
-        return model.transformer.layers, "ffn_norm"
     return model.model.roformer.encoder.layer, "attention.output.LayerNorm"   # roformer
 
 
@@ -45,13 +42,13 @@ def extract_hidden_state(model, src, tgt_in, layer, stack="encoder"):
         tgt_in: ``[batch, tgt_len]`` decoder input ids, starting with BOS. Pass BOS alone
                 for the state at the first decoding step.
         layer:  layer index in the stack, 0-based; negative counts from the last.
-        stack:  ``"encoder"`` or ``"decoder"``. The decoder-only models (roformer, alibi)
-                have only the latter.
+        stack:  ``"encoder"`` or ``"decoder"``. The decoder-only model (roformer) has
+                only the latter.
 
     Returns:
-        ``[batch, seq, d_model]`` float32 on the CPU. ``seq`` is ``src_len`` for the
-        transformer_mask encoder, ``tgt_len`` for its decoder, and ``src_len + tgt_len``
-        for the decoder-only models, whose sequence is each prompt followed directly by
+        ``[batch, seq, d_model]`` float32 on the CPU. ``seq`` is ``src_len`` for an
+        encoder, ``tgt_len`` for its decoder, and ``src_len + tgt_len``
+        for the decoder-only model, whose sequence is each prompt followed directly by
         its answer (``tmodel.models.pack_prompt_and_answer``).
     """
     layers, norm_name = _layers_and_norm(model, stack)

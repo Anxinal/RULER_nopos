@@ -1,2 +1,2 @@
 from .config import ALiBiConfig
-from .model import ALiBiTransformer
+from .model import ALiBiTransformer, ALiBiEncoder, ALiBiDecoder
