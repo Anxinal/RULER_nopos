@@ -41,7 +41,8 @@ def extract_hidden_state(model, src, tgt_in, layer, stack="encoder"):
         src:    ``[batch, src_len]`` prompt ids.
         tgt_in: ``[batch, tgt_len]`` decoder input ids, starting with BOS. Pass BOS alone
                 for the state at the first decoding step.
-        layer:  layer index in the stack, 0-based; negative counts from the last.
+        layer:  layer index in the stack, 0-based; negative counts from the last. A
+                list of indices returns a list of states, all from the same forward pass.
         stack:  ``"encoder"`` or ``"decoder"``. The decoder-only model (roformer) has
                 only the latter.
 
@@ -52,23 +53,28 @@ def extract_hidden_state(model, src, tgt_in, layer, stack="encoder"):
         its answer (``tmodel.models.pack_prompt_and_answer``).
     """
     layers, norm_name = _layers_and_norm(model, stack)
-    norm = layers[layer].get_submodule(norm_name)
+    indices = [layer] if isinstance(layer, int) else list(layer)
 
-    captured = []
-    handle = norm.register_forward_pre_hook(lambda module, inputs: captured.append(inputs[0]))
+    captured = [[] for _ in indices]
+    handles = [layers[i].get_submodule(norm_name).register_forward_pre_hook(
+                   lambda module, inputs, got=got: got.append(inputs[0]))
+               for i, got in zip(indices, captured)]
     was_training = model.training
     model.eval()
     try:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=src.is_cuda):
             model(src, tgt_in)
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
         model.train(was_training)
-    if len(captured) != 1:
-        raise RuntimeError(f"expected the hook on {norm_name} to fire once, got "
-                           f"{len(captured)}; the layer did not run its Python forward.")
+    if any(len(got) != 1 for got in captured):
+        raise RuntimeError(f"expected each hook on {norm_name} to fire once, got "
+                           f"{[len(got) for got in captured]}; a layer did not run its "
+                           f"Python forward.")
 
-    hidden = captured[0]
+    hidden = [got[0] for got in captured]
     if not isinstance(model, DecoderOnlyLM):
-        hidden = hidden.transpose(0, 1)        # nn.Transformer is [seq, batch, d_model]
-    return hidden.float().cpu()
+        hidden = [h.transpose(0, 1) for h in hidden]   # nn.Transformer is [seq, batch, d_model]
+    hidden = [h.float().cpu() for h in hidden]
+    return hidden[0] if isinstance(layer, int) else hidden
