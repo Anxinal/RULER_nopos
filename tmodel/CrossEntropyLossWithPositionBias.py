@@ -6,34 +6,34 @@ import torch.nn.functional as F
 
 
 class CrossEntropyLossWithPositionBias(nn.Module):
-    """Cross-entropy over positions, scaled by how far off the predicted position is.
+    """Cross-entropy over positions against a Gaussian soft label around the true one.
 
-    Each sample's cross-entropy is multiplied by a factor that runs linearly from
-    ``penalty_range[1]`` when the prediction sits on the true position to
-    ``penalty_range[0]`` when it is as far away as the sequence allows:
+    The target is not one-hot: position ``j`` gets the weight
 
-        loss = mean( CE_i * (near + (far - near) * distance_i) )
+        q_j  proportional to  exp(-(j - t)^2 / (2 * sigma^2))
 
-    ``distance_i`` is the EXPECTED distance from the true position under the predicted
-    distribution, divided by ``P - 1`` so it lies in ``[0, 1]`` at any sequence length.
-    It is an expectation, not the distance of the argmax, so it has a gradient.
+    normalised to sum to 1 over the positions, where ``t`` is the true position, and
+
+        loss = mean_i( -sum_j q_ij * log p_ij )
+
+    A prediction a few positions off still earns most of the credit. As ``sigma`` goes
+    to 0 the label becomes one-hot and this is ``nn.CrossEntropyLoss``. The smallest
+    possible loss is the label's entropy, not 0 (about 3.5 at ``sigma=8``).
 
     Args:
-        penalty_range: ``(far, near)``, the factor at the largest and at zero distance.
-        ignore_index:  targets with this value are left out.
+        sigma:        standard deviation of the soft label, in positions.
+        ignore_index: targets with this value are left out.
     """
 
-    def __init__(self, penalty_range=(1.2, 0.5), ignore_index: int = -100):
+    def __init__(self, sigma: float = 8.0, ignore_index: int = -100):
         super().__init__()
-        self.penalty_far, self.penalty_near = penalty_range
+        self.sigma = sigma
         self.ignore_index = ignore_index
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            logits: ``[N, P]``, one score per position. A position that cannot be the
-                answer (e.g. padding) can be given ``-inf``; it then has probability 0
-                and adds nothing to the distance.
+            logits: ``[N, P]``, one finite score per position.
             target: ``[N]`` true position indices in ``[0, P)``, or ``ignore_index``.
 
         Returns:
@@ -44,11 +44,9 @@ class CrossEntropyLossWithPositionBias(nn.Module):
         keep = target != self.ignore_index
         logits, target = logits[keep].float(), target[keep]
 
-        ce = F.cross_entropy(logits, target, reduction="none")           # [n]
-        probs = F.softmax(logits, dim=-1)
         positions = torch.arange(num_positions, device=logits.device)
         # [n, P]: how far each position is from that row's true position.
         distance = (positions.unsqueeze(0) - target.unsqueeze(1)).abs()
-        expected = (probs * distance).sum(dim=-1) / max(num_positions - 1, 1)   # in [0, 1]
-        factor = self.penalty_near + (self.penalty_far - self.penalty_near) * expected
-        return (ce * factor).mean()
+        # softmax of the Gaussian exponent: each row of the label sums to 1.
+        soft = F.softmax(-distance.float().pow(2) / (2 * self.sigma ** 2), dim=-1)
+        return F.cross_entropy(logits, soft)

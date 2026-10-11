@@ -7,6 +7,11 @@ where the model is about to write the answer. Target: the token position in the 
 where the answer starts. Every layer sees the same samples and the same split. Writes
 <run>/position_probe_layer<L>.pt for each layer.
 
+The probe is trained against a Gaussian soft label around the true position
+(``--sigma``, default 8 positions; see ``tmodel/CrossEntropyLossWithPositionBias.py``),
+so a near miss costs less than a far one. The ``loss`` that is logged and saved is
+still the plain cross-entropy against the true position, whatever ``--sigma`` is.
+
 With ``--mode online`` (or ``offline``) the probes are tracked in Weights & Biases, one
 run per (model run, stack) holding every layer:
 
@@ -91,15 +96,19 @@ def main():
     p.add_argument("layers", type=int, nargs="+", help="layer indices, 0-based")
     p.add_argument("--data_dir", required=True, help="RULER training data root")
     p.add_argument("--stack", default="decoder", choices=["encoder", "decoder"])
-    p.add_argument("--num_samples", type=int, default=20000)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--num_samples", type=int, default=60000)
+    p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--sigma", type=float, default=16.0,
+                   help="Width, in positions, of the Gaussian soft label the probe is "
+                        "trained against. 0 trains on the one-hot label (plain "
+                        "cross-entropy).")
     g = p.add_argument_group("wandb")
     g.add_argument("--project", default="Ruler_nopos")
     g.add_argument("--entity", default=None, help="wandb team or user; default is yours.")
-    g.add_argument("--group", default="position_probe")
+    g.add_argument("--group", default="position_probe"
     g.add_argument("--run_name", default=None,
                    help="Default: probe-<run folder>-<stack>.")
     g.add_argument("--mode", default="disabled", choices=["online", "offline", "disabled"],
@@ -145,7 +154,8 @@ def train_probe(args, layer, x, y, split, ckpt, device, run):
     y = y.to(device)
 
     probe = PositionalProbe(x.size(1), output_dim=ckpt["args"]["src_len"]).to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = (CrossEntropyLossWithPositionBias(args.sigma) if args.sigma > 0
+                 else nn.CrossEntropyLoss())
     optimizer = torch.optim.AdamW(probe.parameters(), lr=args.lr)
 
     best_val = float("inf")
