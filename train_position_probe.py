@@ -8,7 +8,7 @@ where the answer starts. Every layer sees the same samples and the same split. W
 <run>/position_probe_layer<L>.pt for each layer.
 
 The probe is trained against a Gaussian soft label around the true position
-(``--sigma``, default 8 positions; see ``tmodel/CrossEntropyLossWithPositionBias.py``),
+(``--sigma``, default 16 positions; see ``tmodel/CrossEntropyLossWithPositionBias.py``),
 so a near miss costs less than a far one. The ``loss`` that is logged and saved is
 still the plain cross-entropy against the true position, whatever ``--sigma`` is.
 
@@ -108,7 +108,7 @@ def main():
     g = p.add_argument_group("wandb")
     g.add_argument("--project", default="Ruler_nopos")
     g.add_argument("--entity", default=None, help="wandb team or user; default is yours.")
-    g.add_argument("--group", default="position_probe"
+    g.add_argument("--group", default="position_probe")
     g.add_argument("--run_name", default=None,
                    help="Default: probe-<run folder>-<stack>.")
     g.add_argument("--mode", default="disabled", choices=["online", "offline", "disabled"],
