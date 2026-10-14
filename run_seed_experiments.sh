@@ -155,7 +155,10 @@ LR=1.5e-4
 # (default 2), which tracks these sizes if they change; this value is for train.py runs.
 WARMUP=2700
 
-EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
+# Early stopping is off: every run trains all EPOCHS (best.pt is still the epoch with the
+# lowest val loss). Set EARLY_STOP_PATIENCE=8 to stop once val loss has been flat for
+# that many epochs; the two settings below only apply then.
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-0}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-3}"
 EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-12}"
 
@@ -200,7 +203,7 @@ done
 #   sinusoidal BBBBBBBB   the vanilla transformer: sinusoidal PE, no mask
 #
 # roformer carries its own position encoding (RoPE) and no mask.
-TM_ARMS=("none CCCCFFFF" "none CCCCCCCC" "sinusoidal BBBBBBBB")
+TM_ARMS=("none CCCCFFFF")
 OTHER_MODELS=("roformer")
 
 for arm in "${TM_ARMS[@]}"; do
