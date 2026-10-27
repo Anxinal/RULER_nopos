@@ -41,7 +41,7 @@ def symmetric_alibi_bias(num_heads: int, seq_len: int, device=None, dtype=None) 
     memory_position = torch.arange(seq_len, device=device)[None, :]
     relative_position = memory_position - context_position 
     relative_position = torch.abs(relative_position).unsqueeze(0).expand(num_heads, -1, -1)
-    relative_position = torch.max(relative_position, MAX_RANGE)
+    relative_position = relative_position.clamp(max=MAX_RANGE)
 
     slopes = torch.tensor(get_slopes(num_heads), device=device, dtype=dtype) * -1
     return slopes.unsqueeze(1).unsqueeze(1) * relative_position
