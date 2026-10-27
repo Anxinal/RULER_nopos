@@ -4,7 +4,7 @@ import torch
 
 from tmodel.maskedVanilla.masks import bucket_dim, build_head_mask_bias
 
-MAX_RANGE = 5
+MAX_RANGE = 15
 
 def get_slopes(n):
     """The first ``n // 2`` ALiBi slopes for ``n`` heads, repeated for the second half.
