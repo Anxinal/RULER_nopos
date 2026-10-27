@@ -5,15 +5,11 @@
 # Seed sweep on the RULER benchmark: every arm below is trained and evaluated with
 # each of SEEDS, one Slurm job per (arm, seed).
 #
-# Arms (4), see TM_ARMS / OTHER_MODELS:
-#   transformer_mask (maskedVanilla, encoder-decoder):
-#       pe none,       mask CCCCFFFF
-#       pe none,       mask CCCCCCCC
-#       pe sinusoidal, mask BBBBBBBB   (vanilla transformer, no mask)
-#   roformer  (decoder-only, RoPE)
-# transformer_mask uses nn.Transformer's sizes, pre-norm; roformer is sized to match it.
-# Both tie their input and output embeddings, ~70M parameters each
-# (see tmodel/models.py).
+# Arms (1), see TM_ARMS / OTHER_MODELS:
+#   alibi_masked  (tmodel/alibi_masked: encoder-decoder, symmetric ALiBi bias plus
+#                  4 causal + 4 future-only encoder heads)
+# The transformer_mask arms and roformer are still supported: add them back to TM_ARMS /
+# OTHER_MODELS. Every model ties its input and output embeddings (see tmodel/models.py).
 #
 # Pipeline (per arm and seed):
 #   1. Generate RULER training data   (scripts/data/prepare.py, once, shared)
@@ -202,11 +198,15 @@ done
 #   none       CCCCCCCC   no position encoding, all heads causal
 #   sinusoidal BBBBBBBB   the vanilla transformer: sinusoidal PE, no mask
 #
-# roformer carries its own position encoding (RoPE) and no mask.
-TM_ARMS=("none CCCCFFFF")
-OTHER_MODELS=("roformer")
+# roformer carries its own position encoding (RoPE) and no mask; alibi and alibi_masked
+# carry the ALiBi attention bias (alibi_masked adds its fixed 4C4F encoder head masks).
+# Only alibi_masked runs for now; the transformer_mask arms are off.
+TM_ARMS=()
+OTHER_MODELS=("alibi_masked")
 
-for arm in "${TM_ARMS[@]}"; do
+# ${arr[@]+"${arr[@]}"}: an empty array is an unbound-variable error under 'set -u' in
+# bash before 4.4 (macOS ships 3.2), so TM_ARMS=() would otherwise abort here.
+for arm in ${TM_ARMS[@]+"${TM_ARMS[@]}"}; do
     spec="${arm#* }"
     if [ ${#spec} -ne "${TM_NUM_HEADS}" ]; then
         echo "ERROR: mask spec '${spec}' has ${#spec} codes but transformer_mask has ${TM_NUM_HEADS} heads." >&2
@@ -228,7 +228,7 @@ exp_name() {
 # the queue holds one complete replicate of every arm before the next seed starts.
 EXPERIMENTS=()
 for seed in "${SEEDS[@]}"; do
-    for arm in "${TM_ARMS[@]}"; do
+    for arm in ${TM_ARMS[@]+"${TM_ARMS[@]}"}; do
         EXPERIMENTS+=("transformer_mask ${arm} ${seed}")
     done
     for model in "${OTHER_MODELS[@]}"; do

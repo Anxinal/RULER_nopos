@@ -3,9 +3,11 @@ import torch
 import torch.nn as nn
 
 from .alibi import ALiBiConfig, ALiBiTransformer
+from .alibi_masked import ALiBiConfig as ALiBiMaskedConfig
+from .alibi_masked import ALiBiTransformer as ALiBiMaskedTransformer
 from .maskedVanilla import TransformerMask
 
-MODEL_TYPES = ("transformer_mask", "roformer", "alibi")
+MODEL_TYPES = ("transformer_mask", "roformer", "alibi", "alibi_masked")
 # Positional encodings for transformer_mask. nn.Transformer ships none, so "sinusoidal"
 # comes from torch_geometric; roformer and alibi carry their own.
 PE_TYPES = ("none", "sinusoidal")
@@ -286,23 +288,33 @@ class ALiBiLM(TransformerMaskLM):
     The input and output embeddings are tied (:func:`tied_embedding`).
     """
 
+    config_cls, transformer_cls, name, variant = ALiBiConfig, ALiBiTransformer, "alibi", ""
+
     def __init__(self, vocab_size: int, pad_token_id: int, dropout: float | None = None):
         nn.Module.__init__(self)
         self.pad_token_id = pad_token_id
-        # None keeps ALiBiConfig's dropout.
-        config = ALiBiConfig(**({} if dropout is None else dict(dropout=dropout)))
-        self.transformer = ALiBiTransformer(config)
+        # None keeps the config's dropout.
+        config = self.config_cls(**({} if dropout is None else dict(dropout=dropout)))
+        self.transformer = self.transformer_cls(config)
         # The config only reaches the nn.Dropout modules; attention dropout is a float
         # on each nn.MultiheadAttention (see set_dropout).
         set_dropout(self.transformer, config.dropout)
         self.embed, self.lm_head = tied_embedding(vocab_size, config.d_model, pad_token_id)
         self.embed_scale = config.d_model ** 0.5
         self.pos_encoding = None
-        self.description = (f"alibi (encoder-decoder, nn.Transformer, pre-norm, tied "
-                            f"embeddings, symmetric ALiBi) | {config.d_model} wide, "
+        self.description = (f"{self.name} (encoder-decoder, nn.Transformer, pre-norm, tied "
+                            f"embeddings, symmetric ALiBi{self.variant}) | {config.d_model} wide, "
                             f"{config.num_heads} heads, {config.num_layers} encoder + "
                             f"{config.num_layers} decoder layers, "
                             f"dropout {config.dropout}")
+
+
+class ALiBiMaskedLM(ALiBiLM):
+    """:class:`ALiBiLM` on ``tmodel/alibi_masked``: the symmetric ALiBi bias, plus 4 causal
+    and 4 future-only heads in the encoder. Sizes from that package's ``ALiBiConfig``."""
+
+    config_cls, transformer_cls = ALiBiMaskedConfig, ALiBiMaskedTransformer
+    name, variant = "alibi_masked", " + 4C4F encoder heads"
 
 
 def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
@@ -332,4 +344,6 @@ def build_model(model_type: str, vocab_size: int, pad_token_id: int, *,
         return RoFormerLM(vocab_size, pad_token_id, max_len, dropout)
     if model_type == "alibi":
         return ALiBiLM(vocab_size, pad_token_id, dropout)
+    if model_type == "alibi_masked":
+        return ALiBiMaskedLM(vocab_size, pad_token_id, dropout)
     raise ValueError(f"unknown model {model_type!r}; expected one of {MODEL_TYPES}")
