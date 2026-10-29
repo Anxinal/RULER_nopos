@@ -4,7 +4,7 @@ import torch
 
 from tmodel.maskedVanilla.masks import bucket_dim, build_head_mask_bias
 
-MAX_RANGE = 15
+MAX_RANGE = 25
 
 def get_slopes(n):
     """The first ``n // 2`` ALiBi slopes for ``n`` heads, repeated for the second half.
@@ -13,8 +13,8 @@ def get_slopes(n):
     get the same set of slopes. With an odd ``n`` the middle head keeps its own slope.
     """
     def get_slopes_power_of_2(n):
-        start = (2**(-2**-(math.log2(n)-3)))
-        ratio = start
+        ratio = 2**(-2**-(math.log2(n)-3))
+        start = ratio * 0.25    # scales every slope by 0.25; the ratio between heads is unchanged
         return [start*ratio**i for i in range(n)]
 
     def all_slopes(n):
